@@ -10,7 +10,7 @@
  */
 
 import { env } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import fixture from "./fixtures/06483.html?raw";
 
 // --------------------------------------------------------------- helpers
@@ -18,19 +18,10 @@ import fixture from "./fixtures/06483.html?raw";
 const DB = env.DB;
 
 /**
- * NOTE for every downstream phase: `@cloudflare/vitest-plugin@1.1.4` does NOT
- * give per-test isolated storage — the local D1 is shared by every test in a
- * file and writes survive from one `it()` to the next. Clean up explicitly.
- * Order matters: children before parents, because of the FK references.
+ * The database is reset before every `it()` by test/setup.ts, which runs for
+ * every test file in the project. Storage is isolated per FILE, not per test,
+ * so that global hook is what makes these tests order-independent.
  */
-beforeEach(async () => {
-  await DB.batch([
-    DB.prepare("DELETE FROM notifications"),
-    DB.prepare("DELETE FROM prices"),
-    DB.prepare("DELETE FROM subscriptions"),
-    DB.prepare("DELETE FROM zips"),
-  ]);
-});
 
 function countMatches(re: RegExp): number {
   return (fixture.match(re) ?? []).length;
@@ -44,14 +35,30 @@ function distribution(values: string[]): Record<string, number> {
 
 /** Runs a statement and resolves to true when D1 rejected it. */
 async function rejects(sql: string, ...bind: unknown[]): Promise<boolean> {
+  return (await rejectionOf(sql, ...bind)) !== null;
+}
+
+/**
+ * Runs a statement and resolves to the rejection message, or null if it
+ * succeeded. Tests assert on the message so that a schema typo cannot
+ * masquerade as the constraint violation we meant to provoke.
+ */
+async function rejectionOf(sql: string, ...bind: unknown[]): Promise<string | null> {
   try {
     await DB.prepare(sql)
       .bind(...bind)
       .run();
-    return false;
-  } catch {
-    return true;
+    return null;
+  } catch (e) {
+    return String((e as Error).message ?? e);
   }
+}
+
+/** Asserts the statement was rejected specifically by a CHECK constraint. */
+async function expectCheckViolation(sql: string, ...bind: unknown[]): Promise<void> {
+  const message = await rejectionOf(sql, ...bind);
+  expect(message, "statement was expected to be rejected, but it succeeded").not.toBeNull();
+  expect(message).toMatch(/CHECK constraint failed/i);
 }
 
 const INSERT_PRICE = `
@@ -339,4 +346,108 @@ describe("harness", () => {
   it("exposes HTMLRewriter, the real workerd global", () => {
     expect(typeof HTMLRewriter).toBe("function");
   });
+});
+
+/**
+ * Exhaustive CHECK coverage. migrations/0001_init.sql declares 16 CHECK
+ * clauses; every one gets a row here. Each case starts from a row that is
+ * otherwise valid and mutates exactly ONE column, so a rejection can only be
+ * attributable to the constraint under test — and the assertion requires the
+ * error to actually name a CHECK violation, not merely to be some error.
+ */
+describe("CHECK constraints: every clause in the migration", () => {
+  interface Case {
+    name: string;
+    table: "zips" | "prices" | "subscriptions";
+    column: string;
+    value: unknown;
+  }
+
+  const cases: Case[] = [
+    { name: "zips.zip too short", table: "zips", column: "zip", value: "0648" },
+    { name: "zips.zip non-numeric", table: "zips", column: "zip", value: "0648A" },
+    { name: "zips.active out of range", table: "zips", column: "active", value: 2 },
+
+    { name: "prices.scrape_date unpadded", table: "prices", column: "scrape_date", value: "2026-9-6" },
+    { name: "prices.zip too short", table: "prices", column: "zip", value: "6483" },
+    { name: "prices.dealer_id zero", table: "prices", column: "dealer_id", value: 0 },
+    { name: "prices.dealer_id negative", table: "prices", column: "dealer_id", value: -11 },
+    { name: "prices.payment_type unknown", table: "prices", column: "payment_type", value: "debit" },
+    { name: "prices.gallon_min zero", table: "prices", column: "gallon_min", value: 0 },
+    { name: "prices.gallon_max below gallon_min", table: "prices", column: "gallon_max", value: 50 },
+    { name: "prices.price_per_gallon zero", table: "prices", column: "price_per_gallon", value: 0 },
+    { name: "prices.price_per_gallon negative", table: "prices", column: "price_per_gallon", value: -1 },
+    { name: "prices.delivery_date malformed", table: "prices", column: "delivery_date", value: "Sep 8th 2026" },
+    { name: "prices.price_updated_on malformed", table: "prices", column: "price_updated_on", value: "2026/09/05" },
+
+    { name: "subscriptions.zip too short", table: "subscriptions", column: "zip", value: "648" },
+    { name: "subscriptions.min_gallons zero", table: "subscriptions", column: "min_gallons", value: 0 },
+    { name: "subscriptions.payment_type unknown", table: "subscriptions", column: "payment_type", value: "crypto" },
+    { name: "subscriptions.threshold zero", table: "subscriptions", column: "threshold", value: 0 },
+    { name: "subscriptions.threshold negative", table: "subscriptions", column: "threshold", value: -5 },
+    { name: "subscriptions.active out of range", table: "subscriptions", column: "active", value: 7 },
+  ];
+
+  const baselines = {
+    zips: {
+      zip: "06483",
+      slug: "seymour_ct_oil_prices/06483",
+      city: "seymour",
+      state: "ct",
+      active: 1,
+      slug_resolved_at: "2026-09-05T12:00:00.000Z",
+    } as Record<string, unknown>,
+    prices: {
+      scrape_date: "2026-09-05",
+      zip: "06483",
+      dealer_id: 11,
+      payment_type: "cash",
+      gallon_min: 100,
+      gallon_max: 149,
+      price_per_gallon: 4.84,
+      delivery_date: "2026-09-08",
+      price_updated_on: "2026-09-05",
+      same_day_charge: 0,
+      scraped_at: "2026-09-05T12:00:00.000Z",
+    } as Record<string, unknown>,
+    subscriptions: {
+      user_id: "v1",
+      zip: "06483",
+      ntfy_topic: "heating-oil-local-dev",
+      min_gallons: 100,
+      payment_type: "cash",
+      threshold: null,
+      active: 1,
+    } as Record<string, unknown>,
+  };
+
+  function statementFor(table: Case["table"], row: Record<string, unknown>) {
+    const cols = Object.keys(row);
+    const sql = `INSERT INTO ${table} (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`;
+    return { sql, args: cols.map((c) => row[c]) };
+  }
+
+  // Guard: each baseline must itself be accepted, otherwise every case below
+  // would "pass" for the wrong reason.
+  it("baseline rows are valid", async () => {
+    for (const table of ["zips", "prices", "subscriptions"] as const) {
+      if (table !== "zips") await seedZip();
+      const { sql, args } = statementFor(table, baselines[table]);
+      expect(await rejectionOf(sql, ...args), `${table} baseline`).toBeNull();
+      await DB.batch([
+        DB.prepare("DELETE FROM subscriptions"),
+        DB.prepare("DELETE FROM prices"),
+        DB.prepare("DELETE FROM zips"),
+      ]);
+    }
+  });
+
+  for (const c of cases) {
+    it(`rejects ${c.name}`, async () => {
+      if (c.table !== "zips") await seedZip();
+      const row = { ...baselines[c.table], [c.column]: c.value };
+      const { sql, args } = statementFor(c.table, row);
+      await expectCheckViolation(sql, ...args);
+    });
+  }
 });
