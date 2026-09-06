@@ -1,0 +1,21 @@
+# Local-only overrides for `wrangler dev`. Copy to `.dev.vars` and edit.
+#
+# `.dev.vars` is gitignored and must stay that way.
+#
+# In v1 there is exactly one override that matters: NTFY_ALERT_TOPIC.
+#
+# On unauthenticated ntfy.sh the topic name IS the credential — anyone who knows
+# the topic can read and publish to it. That is why the value committed in
+# wrangler.jsonc ("heating-oil-alerts-placeholder") is deliberately NOT the real
+# topic, and why the real one is never written into any tracked file.
+#
+#   - production: `wrangler secret put NTFY_ALERT_TOPIC` (a secret of the same
+#     name overrides the `vars` entry). Done in Phase 9.
+#   - locally:    set it here if you want real local alerts. Otherwise the
+#     placeholder stands, which is harmless — every local test injects a stub
+#     `fetchImpl` and issues no network request.
+#
+# Subscriber topics are never in config at all: they live only in D1, in
+# subscriptions.ntfy_topic.
+
+NTFY_ALERT_TOPIC = "replace-with-your-private-alert-topic"

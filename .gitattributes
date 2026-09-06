@@ -1,0 +1,7 @@
+# This machine has core.autocrlf=true globally. Without this rule git would
+# check out the generated fixture with CRLF endings in every other worktree,
+# breaking both its "LF only" assertion and its recorded SHA-256.
+# Scoped deliberately to the fixture: a repo-wide `* text=auto eol=lf` would
+# also renormalise docs/view-source_*.html, which is the extractor's input and
+# must stay byte-for-byte as captured.
+/test/fixtures/06483.html text eol=lf

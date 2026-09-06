@@ -1,0 +1,24 @@
+{
+  "name": "heating-oil-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "migrate:local": "wrangler d1 migrations apply heating-oil --local",
+    "dryrun": "wrangler deploy --dry-run --outdir=dist",
+    "fixture": "node scripts/extract-fixture.mjs",
+    "cf-types": "wrangler types --include-runtime=false",
+    "seed:local": "node scripts/seed.mjs",
+    "seed:dry": "node scripts/seed.mjs --dry-run",
+    "smoke": "node scripts/smoke-quickstart.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.1.4",
+    "@cloudflare/workers-types": "^4.20250906.0",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.129.0"
+  }
+}
