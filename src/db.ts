@@ -19,6 +19,11 @@
  * ---------------------------------------------------------------------------
  * Per-invocation query budget (D1 caps a Worker invocation at 50 queries)
  * ---------------------------------------------------------------------------
+ * The per-subscription pair (`wasNotified` + `recordNotified`) made the cost
+ * `8 + 2S` for S subscriptions, so ~21 subscriptions on one zip would breach the
+ * 50-query cap. `getNotifiedFingerprints` and `recordNotifiedBatch` replace that
+ * pair with two statements that do not grow with S, making the cost constant.
+ *
  * For one zip whose page yields 39 price rows and which has two subscriptions
  * that both get notified:
  *
@@ -27,15 +32,17 @@
  *   + 5  INSERTs             (ceil(39 / 8) = 5, same batch)
  *   + 1  slug update         (updateZipSlug; skipped when the cached slug held)
  *   + 1  subscription read   (getActiveSubscriptions)
- *   + 2  wasNotified         (one per subscription)
- *   + 2  recordNotified      (one per subscription)
+ *   + 1  dedupe read         (getNotifiedFingerprints, one IN (...) query)
+ *   + 1  dedupe write        (recordNotifiedBatch, one multi-row INSERT)
  *   ------------------------------------------------------------------
- *   = 13 of 50
+ *   = 11 of 50
  *
  * On a cached slug the slug update does not happen, so the realistic steady
- * state is 12 and the worst case above is 13. Phase 7's guard is therefore set
- * at 14 — one slot of headroom over the worst realistic case, and still 36
- * queries below D1's cap.
+ * state is 10 and the worst case above is 11. Phase 7's guard stays at 14 —
+ * headroom over both, and still far below D1's cap.
+ *
+ * `wasNotified` and `recordNotified` are retained as the single-row API; the
+ * orchestration layer uses the batch pair.
  *
  * ---------------------------------------------------------------------------
  * Why `writePriceRows` is a REPLACE, not an upsert
@@ -270,4 +277,100 @@ export async function recordNotified(
     )
     .bind(scrapeDate, subscriptionId, fingerprint, sentAt)
     .run();
+}
+
+/** One `notifications` row, as handed to `recordNotifiedBatch`. */
+export interface NotifiedRow {
+  scrape_date: string;
+  subscription_id: number;
+  fingerprint: string;
+  sent_at: string;
+}
+
+/**
+ * The dedupe state for every subscription in one call, so the read cost does
+ * not grow with the number of subscriptions (the previous one-`wasNotified`-per-
+ * subscription shape put ~21 subscriptions over D1's 50-query cap).
+ *
+ * Returns `subscription_id -> fingerprint` for the rows that exist. A missing
+ * key means "never notified today"; a present key whose value differs from the
+ * fingerprint of today's decision means the price genuinely changed since the
+ * recorded send, which the caller treats as a reason to send again rather than
+ * to suppress.
+ *
+ * An empty `subscriptionIds` issues **no query at all**.
+ *
+ * One statement binds `1 + subscriptionIds.length` parameters against D1's
+ * 100-parameter cap, so this supports up to 99 subscriptions on a single zip —
+ * far beyond anything this project will see.
+ */
+export async function getNotifiedFingerprints(
+  db: D1Database,
+  scrapeDate: string,
+  subscriptionIds: number[],
+): Promise<Map<number, string>> {
+  const out = new Map<number, string>();
+  if (subscriptionIds.length === 0) return out;
+
+  const placeholders = subscriptionIds.map(() => "?").join(",");
+  const result = await db
+    .prepare(
+      "SELECT subscription_id, fingerprint FROM notifications " +
+        `WHERE scrape_date = ? AND subscription_id IN (${placeholders})`,
+    )
+    .bind(scrapeDate, ...subscriptionIds)
+    .all<{ subscription_id: number; fingerprint: string }>();
+
+  for (const row of result.results ?? []) {
+    out.set(row.subscription_id, row.fingerprint);
+  }
+  return out;
+}
+
+/**
+ * Max `notifications` rows per multi-row INSERT. A row binds 4 columns, so 24
+ * rows = 96 bound parameters against D1's 100-parameter cap. Kept conservative
+ * for the same reason as `ROWS_PER_INSERT`.
+ */
+const NOTIFIED_ROWS_PER_INSERT = 24;
+
+/**
+ * Records every send of one run in a single `db.batch()`, so the write cost does
+ * not grow with the number of subscriptions either.
+ *
+ * `DO UPDATE`, not `DO NOTHING`: the caller only reaches this for a send it
+ * actually made, and on a same-day re-run where the price CHANGED the row must
+ * carry the fingerprint that was last pushed — otherwise the stored fingerprint
+ * describes a notification the phone no longer has, and the next comparison is
+ * made against a stale value.
+ *
+ * An empty `rows` issues **no query at all**.
+ */
+export async function recordNotifiedBatch(
+  db: D1Database,
+  rows: NotifiedRow[],
+): Promise<void> {
+  if (rows.length === 0) return;
+
+  const statements: D1PreparedStatement[] = [];
+  for (let i = 0; i < rows.length; i += NOTIFIED_ROWS_PER_INSERT) {
+    const chunk = rows.slice(i, i + NOTIFIED_ROWS_PER_INSERT);
+    const values = chunk.map(() => "(?,?,?,?)").join(", ");
+    const params: unknown[] = [];
+    for (const row of chunk) {
+      params.push(row.scrape_date, row.subscription_id, row.fingerprint, row.sent_at);
+    }
+    statements.push(
+      db
+        .prepare(
+          "INSERT INTO notifications (scrape_date, subscription_id, fingerprint, sent_at) " +
+            `VALUES ${values} ` +
+            "ON CONFLICT (scrape_date, subscription_id) DO UPDATE SET " +
+            "fingerprint = excluded.fingerprint, sent_at = excluded.sent_at",
+        )
+        .bind(...params),
+    );
+  }
+
+  await db.batch(statements);
 }

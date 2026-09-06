@@ -15,8 +15,10 @@ import {
   clearZipSlug,
   getActiveSubscriptions,
   getActiveZips,
+  getNotifiedFingerprints,
   getZip,
   recordNotified,
+  recordNotifiedBatch,
   updateZipSlug,
   wasNotified,
   writePriceRows,
@@ -460,5 +462,160 @@ describe("notification de-duplication", () => {
     await seedSub(1);
     await recordNotified(DB, SCRAPE_DATE, 1, "fp-1", SCRAPED_AT);
     expect(await wasNotified(DB, SCRAPE_DATE, 2)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the batched dedupe API
+//
+// `wasNotified`/`recordNotified` above are the single-row API and stay. These
+// two exist because the orchestration layer called the single-row pair ONCE PER
+// SUBSCRIPTION, making the per-invocation cost 8 + 2S — past D1's 50-query cap
+// at roughly 21 subscriptions on one zip. These do the same work in two
+// statements regardless of S.
+// ---------------------------------------------------------------------------
+
+describe("batched notification de-duplication", () => {
+  async function seedSubs(ids: number[]): Promise<void> {
+    await seedZip();
+    await DB.batch(
+      ids.map((id) =>
+        DB.prepare(
+          "INSERT INTO subscriptions (id, user_id, zip, ntfy_topic, min_gallons, payment_type, threshold, active) VALUES (?,?,?,?,?,?,?,?)",
+        // `user_id` varies: subscriptions carry a UNIQUE
+        // (user_id, zip, ntfy_topic, payment_type, min_gallons).
+        ).bind(id, `v${id}`, ZIP, "heating-oil-local-dev", 100, "cash", null, 1),
+      ),
+    );
+  }
+
+  /** A D1 handle that refuses to prepare anything, to prove "zero queries". */
+  const noQueryDb = {
+    prepare() {
+      throw new Error("no query should have been issued");
+    },
+    batch() {
+      throw new Error("no batch should have been issued");
+    },
+  } as unknown as typeof DB;
+
+  describe("getNotifiedFingerprints", () => {
+    it("returns an empty map for an empty id list WITHOUT issuing a query", async () => {
+      const map = await getNotifiedFingerprints(noQueryDb, SCRAPE_DATE, []);
+      expect(map.size).toBe(0);
+    });
+
+    it("returns nothing when no notification has been recorded", async () => {
+      await seedSubs([1, 2]);
+      const map = await getNotifiedFingerprints(DB, SCRAPE_DATE, [1, 2]);
+      expect(map.size).toBe(0);
+    });
+
+    it("reads every recorded fingerprint in one call", async () => {
+      await seedSubs([1, 2, 3]);
+      await recordNotifiedBatch(DB, [
+        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-1", sent_at: SCRAPED_AT },
+        { scrape_date: SCRAPE_DATE, subscription_id: 3, fingerprint: "fp-3", sent_at: SCRAPED_AT },
+      ]);
+
+      const map = await getNotifiedFingerprints(DB, SCRAPE_DATE, [1, 2, 3]);
+
+      expect(map.get(1)).toBe("fp-1");
+      expect(map.get(3)).toBe("fp-3");
+      // Subscription 2 was never notified, so it must be absent, not empty.
+      expect(map.has(2)).toBe(false);
+    });
+
+    it("is scoped to the day and to the requested ids", async () => {
+      await seedSubs([1, 2]);
+      await recordNotifiedBatch(DB, [
+        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-1", sent_at: SCRAPED_AT },
+        { scrape_date: SCRAPE_DATE, subscription_id: 2, fingerprint: "fp-2", sent_at: SCRAPED_AT },
+      ]);
+
+      expect((await getNotifiedFingerprints(DB, "2026-09-07", [1, 2])).size).toBe(0);
+      const only1 = await getNotifiedFingerprints(DB, SCRAPE_DATE, [1]);
+      expect([...only1.keys()]).toEqual([1]);
+    });
+  });
+
+  describe("recordNotifiedBatch", () => {
+    it("is a no-op issuing zero queries for an empty array", async () => {
+      await expect(recordNotifiedBatch(noQueryDb, [])).resolves.toBeUndefined();
+    });
+
+    it("writes every row in one call", async () => {
+      await seedSubs([1, 2]);
+      await recordNotifiedBatch(DB, [
+        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-1", sent_at: SCRAPED_AT },
+        { scrape_date: SCRAPE_DATE, subscription_id: 2, fingerprint: "fp-2", sent_at: SCRAPED_AT },
+      ]);
+
+      const r = await DB.prepare("SELECT COUNT(*) AS c FROM notifications").first<{ c: number }>();
+      expect(r!.c).toBe(2);
+      expect(await wasNotified(DB, SCRAPE_DATE, 1)).toBe(true);
+      expect(await wasNotified(DB, SCRAPE_DATE, 2)).toBe(true);
+    });
+
+    it("UPDATES an existing row when the fingerprint differs", async () => {
+      await seedSubs([1]);
+      await recordNotifiedBatch(DB, [
+        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-old", sent_at: SCRAPED_AT },
+      ]);
+
+      // The price moved and a second push really was made the same day. The row
+      // must now describe the message the phone actually holds — otherwise the
+      // next comparison is made against a fingerprint that was superseded.
+      const later = "2026-09-06T18:00:00.000Z";
+      await recordNotifiedBatch(DB, [
+        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-new", sent_at: later },
+      ]);
+
+      const row = await DB.prepare(
+        "SELECT fingerprint, sent_at FROM notifications WHERE scrape_date = ? AND subscription_id = 1",
+      )
+        .bind(SCRAPE_DATE)
+        .first<{ fingerprint: string; sent_at: string }>();
+      expect(row?.fingerprint).toBe("fp-new");
+      expect(row?.sent_at).toBe(later);
+
+      const count = await DB.prepare("SELECT COUNT(*) AS c FROM notifications").first<{ c: number }>();
+      expect(count!.c).toBe(1);
+    });
+
+    it("does not throw when re-recording an identical row", async () => {
+      await seedSubs([1]);
+      const row = {
+        scrape_date: SCRAPE_DATE,
+        subscription_id: 1,
+        fingerprint: "fp-1",
+        sent_at: SCRAPED_AT,
+      };
+      await recordNotifiedBatch(DB, [row]);
+      await expect(recordNotifiedBatch(DB, [row])).resolves.toBeUndefined();
+      const count = await DB.prepare("SELECT COUNT(*) AS c FROM notifications").first<{ c: number }>();
+      expect(count!.c).toBe(1);
+    });
+
+    it("chunks past the 100-bound-parameter cap: 30 rows in one call", async () => {
+      const ids = Array.from({ length: 30 }, (_, i) => i + 1);
+      await seedSubs(ids);
+
+      await recordNotifiedBatch(
+        DB,
+        ids.map((id) => ({
+          scrape_date: SCRAPE_DATE,
+          subscription_id: id,
+          fingerprint: `fp-${id}`,
+          sent_at: SCRAPED_AT,
+        })),
+      );
+
+      const count = await DB.prepare("SELECT COUNT(*) AS c FROM notifications").first<{ c: number }>();
+      expect(count!.c).toBe(30);
+      const map = await getNotifiedFingerprints(DB, SCRAPE_DATE, ids);
+      expect(map.size).toBe(30);
+      expect(map.get(30)).toBe("fp-30");
+    });
   });
 });

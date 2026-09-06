@@ -475,6 +475,34 @@ describe("sendNtfy", () => {
     await expect(sendNtfy(env, "my-topic", msg, impl)).resolves.toBe(false);
   });
 
+  it("passes an abort signal so a stalled connection cannot hold the invocation", async () => {
+    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
+    await sendNtfy(env, "my-topic", msg, impl);
+    const signal = (calls[0]!.init as RequestInit).signal;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal!.aborted).toBe(false);
+  });
+
+  it("returns false — never throws — when the request is ABORTED by the timeout", async () => {
+    // A queue invocation has a 15-minute ceiling; without a timeout a stalled
+    // ntfy connection burns it. The abort must surface as a `false`, exactly
+    // like any other transport failure, so no data that is already in D1 is
+    // treated as lost.
+    const impl = (async () => {
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    }) as unknown as typeof fetch;
+    await expect(sendNtfy(env, "my-topic", msg, impl)).resolves.toBe(false);
+  });
+
+  it("sendAlert also returns false on an AbortError rather than throwing", async () => {
+    const impl = (async () => {
+      const err = new Error("aborted");
+      err.name = "AbortError";
+      throw err;
+    }) as unknown as typeof fetch;
+    await expect(sendAlert(env, "t", "b", impl)).resolves.toBe(false);
+  });
+
   describe("rejects a malformed topic without issuing a request", () => {
     const bad = ["", "../admin", "a/b", "topic with spaces", "a".repeat(65), "t;rm -rf"];
     for (const topic of bad) {

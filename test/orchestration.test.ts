@@ -11,8 +11,10 @@
  */
 import {
   createExecutionContext,
+  createMessageBatch,
   createScheduledController,
   env as testEnv,
+  getQueueResult,
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -336,11 +338,157 @@ describe("processZip — end to end against the real fixture", () => {
     expect(stub.siteCalls()[0]?.url).toBe(SLUG_URL);
 
     // 1 getZip + 1 DELETE + 5 INSERT + 1 subscription read
-    // + 2 wasNotified + 2 recordNotified.
+    // + 1 getNotifiedFingerprints + 1 recordNotifiedBatch = 10.
+    //
+    // The dedupe pair no longer scales with the subscription count: it was
+    // 2 statements PER subscription (12 here, and past D1's 50-query cap at
+    // ~21 subscriptions), and is now 2 statements in total.
     const observed = counter.prepares();
     console.log(`[query guard] cached-slug happy path issued ${observed} D1 statements`);
-    expect(observed).toBe(12);
+    expect(observed).toBe(10);
     expect(observed).toBeLessThanOrEqual(14);
+  });
+
+  it("the dedupe cost does not grow with the subscription count", async () => {
+    await seed(SLUG);
+    // Eight more subscriptions on the same zip. Under the old one-wasNotified-
+    // and-one-recordNotified-per-subscription shape this would have cost 20
+    // dedupe statements; it now costs 2, so the total is unchanged at 10.
+    await baseEnv.DB.batch(
+      Array.from({ length: 8 }, (_, i) =>
+        // `user_id` varies: subscriptions carry a UNIQUE
+        // (user_id, zip, ntfy_topic, payment_type, min_gallons).
+        baseEnv.DB.prepare(
+          "INSERT INTO subscriptions (id, user_id, zip, ntfy_topic, min_gallons, payment_type, threshold, active) " +
+            "VALUES (?,?,?,?,100,'cash',NULL,1)",
+        ).bind(10 + i, `v${10 + i}`, ZIP, SUB_TOPIC),
+      ),
+    );
+
+    const stub = makeStub();
+    const counter = countingDb(baseEnv.DB);
+    const env = { ...baseEnv, DB: counter.db } as Env;
+
+    const result = await processZip(message(), env, stub.impl);
+
+    expect(result.notifications_sent).toBe(10);
+    expect(counter.prepares()).toBe(10);
+    expect(counter.prepares()).toBeLessThanOrEqual(14);
+  });
+});
+
+// ===========================================================================
+// fingerprint dedupe — unchanged price vs changed price
+// ===========================================================================
+
+describe("processZip — the dedupe compares the fingerprint, it does not just test for a row", () => {
+  it("a re-run with an UNCHANGED price sends nothing", async () => {
+    await seed(null);
+    const stub = makeStub();
+
+    await processZip(message(), baseEnv, stub.impl);
+    expect(stub.subCalls()).toHaveLength(2);
+
+    const second = await processZip(message(), baseEnv, stub.impl);
+
+    expect(second.notifications_sent).toBe(0);
+    expect(stub.subCalls()).toHaveLength(2);
+  });
+
+  it("a re-run with a CHANGED price sends again — a real price move is not suppressed", async () => {
+    await seed(null);
+    const first = makeStub();
+    await processZip(message(), baseEnv, first.impl);
+    expect(first.subCalls()).toHaveLength(2);
+    expect(await countNotifications()).toBe(2);
+
+    // The site now quotes $4.29 where it quoted $4.84 for the 100+ cash tier.
+    // Same day, same subscriptions — but a genuinely different message, so the
+    // stored fingerprint no longer matches and both subscribers must hear it.
+    // A replacement FUNCTION, not a string: "$4" in a replacement string is
+    // capture-group syntax and this test must not depend on how that degrades.
+    const cheaperFixture = fixture.replace(/\$4\.84/g, () => "$4.29");
+    const second = makeStub({ html: cheaperFixture });
+
+    const result = await processZip(message(), baseEnv, second.impl);
+
+    expect(result.notifications_sent).toBe(1);
+    const bodies = second.subCalls().map(second.bodyOf);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain("$4.29 per gallon");
+
+    // Still exactly two dedupe rows — the batch UPDATEd, it did not duplicate.
+    expect(await countNotifications()).toBe(2);
+
+    // And the stored fingerprint now describes the message actually pushed.
+    const row = await baseEnv.DB.prepare(
+      "SELECT fingerprint FROM notifications WHERE scrape_date = ? AND subscription_id = 1",
+    )
+      .bind(SCRAPE_DATE)
+      .first<{ fingerprint: string }>();
+    expect(row?.fingerprint).toContain("4.29");
+  });
+});
+
+// ===========================================================================
+// per-subscription failures must not be silently lost
+// ===========================================================================
+
+/** Wraps a D1 handle so any prepare() whose SQL matches `pattern` throws. */
+function dbFailingOn(db: D1Database, pattern: RegExp): D1Database {
+  return new Proxy(db as unknown as Record<string, unknown>, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop);
+      if (prop === "prepare") {
+        return (sql: string) => {
+          if (pattern.test(sql)) throw new Error("D1 dedupe write is down");
+          return (value as (s: string) => unknown).call(target, sql);
+        };
+      }
+      return typeof value === "function" ? (value as Function).bind(target) : value;
+    },
+  }) as unknown as D1Database;
+}
+
+describe("processZip — a failed notification task is never silently ACKed", () => {
+  it("rejects when recording the sends fails, AFTER the pushes actually went out", async () => {
+    await seed(SLUG);
+    const stub = makeStub();
+    const env = {
+      ...baseEnv,
+      DB: dbFailingOn(baseEnv.DB, /INSERT INTO notifications/),
+    } as Env;
+
+    await expect(processZip(message(), env, stub.impl)).rejects.toThrow(
+      /task\(s\) failed after 39 price rows were written/,
+    );
+
+    // The price rows are durable, and both subscribers really were notified —
+    // the failure is only in the dedupe bookkeeping.
+    expect(await countPrices()).toBe(39);
+    expect(stub.subCalls()).toHaveLength(2);
+    // Nothing recorded, which is exactly why the message must be retried.
+    expect(await countNotifications()).toBe(0);
+  });
+
+  it("through queue(), that failure RETRIES the message rather than acking it", async () => {
+    await seed(SLUG);
+    const stub = makeStub();
+    vi.stubGlobal("fetch", stub.impl);
+    const env = {
+      ...baseEnv,
+      DB: dbFailingOn(baseEnv.DB, /INSERT INTO notifications/),
+    } as Env;
+
+    const { batch, acked, retried } = fakeBatch([message()]);
+    const ctx = createExecutionContext();
+    await worker.queue(batch, env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(retried).toEqual([0]);
+    expect(acked).toEqual([]);
+    expect(stub.alertCalls()).toHaveLength(1);
+    expect(stub.bodyOf(stub.alertCalls()[0]!)).toContain("task(s) failed");
   });
 });
 
@@ -364,6 +512,23 @@ describe("processZip — zero listings", () => {
     expect(await countPrices()).toBe(0);
     expect(stub.subCalls()).toHaveLength(0);
     expect(stub.alertCalls()).toHaveLength(0);
+  });
+
+  it("DOES persist the resolved slug — the branch writes no PRICE rows, not nothing", async () => {
+    await seed(null);
+    const stub = makeStub({ html: strippedFixture });
+
+    await processZip(message(), baseEnv, stub.impl);
+
+    // updateZipSlug runs at step 3, BEFORE the parse at step 4. That is
+    // deliberate — the page fetched and was structurally valid, so its URL is
+    // worth caching — and this assertion pins it so the docblock's "writes no
+    // PRICE rows" wording cannot silently drift back to "writes nothing".
+    const zipRow = await readZip();
+    expect(zipRow?.slug).toBe(SLUG);
+    expect(zipRow?.city).toBe("seymour");
+    expect(zipRow?.state).toBe("ct");
+    expect(await countPrices()).toBe(0);
   });
 });
 
@@ -392,6 +557,48 @@ describe("processZip — FetchError", () => {
     expect(zipRow?.slug_resolved_at).toBeNull();
     expect(await countPrices()).toBe(0);
     expect(stub.alertCalls()).toHaveLength(0);
+  });
+
+  it("still propagates the FetchError when the slug cleanup ITSELF fails, and logs it", async () => {
+    await seed(SLUG);
+    const stub = makeStub({ slugStatus: 500, postStatus: 500 });
+    const env = {
+      ...baseEnv,
+      DB: dbFailingOn(baseEnv.DB, /UPDATE zips SET slug = NULL/),
+    } as Env;
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // The FetchError is what queue() routes on, so a cleanup failure must not
+    // replace it — but it must not vanish either.
+    await expect(processZip(message(), env, stub.impl)).rejects.toBeInstanceOf(FetchError);
+
+    expect(errors.mock.calls.flat().join("\n")).toContain("SLUG_CLEANUP_FAILED");
+
+    // The slug is still there, which is precisely what the log is warning about.
+    expect((await readZip())?.slug).toBe(SLUG);
+    errors.mockRestore();
+  });
+
+  it("carries the cleanup failure into the alert body through queue()", async () => {
+    await seed(SLUG);
+    const stub = makeStub({ slugStatus: 500, postStatus: 500 });
+    vi.stubGlobal("fetch", stub.impl);
+    const env = {
+      ...baseEnv,
+      DB: dbFailingOn(baseEnv.DB, /UPDATE zips SET slug = NULL/),
+    } as Env;
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { batch, acked, retried } = fakeBatch([message()]);
+    const ctx = createExecutionContext();
+    await worker.queue(batch, env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(retried).toEqual([0]);
+    expect(acked).toEqual([]);
+    expect(stub.alertCalls()).toHaveLength(1);
+    expect(stub.bodyOf(stub.alertCalls()[0]!)).toContain("SLUG_CLEANUP_FAILED");
+    errors.mockRestore();
   });
 });
 
@@ -477,6 +684,35 @@ describe("scheduled — the cron producer", () => {
     for (const b of batches) expect(b.length).toBeLessThanOrEqual(100);
     expect(batches.flat()).toHaveLength(250);
     expect(stub.calls).toHaveLength(0);
+  });
+
+  it("ALERTS and enqueues nothing when there are zero active zips", async () => {
+    // No zips at all — which is also the committed seed's state, since the seed
+    // deliberately leaves every zip inactive. Without an alert here a forgotten
+    // production activation is indefinite silence behind a green cron.
+    const stub = makeStub();
+    vi.stubGlobal("fetch", stub.impl);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { queue, batches } = fakeQueue();
+    const env = { ...baseEnv, SCRAPE_QUEUE: queue } as Env;
+
+    const controller = createScheduledController({
+      scheduledTime: new Date("2026-09-06T12:00:00.000Z"),
+      cron: "0 12 * * *",
+    });
+    const ctx = createExecutionContext();
+
+    // Returns normally: a misconfiguration is not a crash, and throwing would
+    // burn the cron's error budget every single day.
+    await expect(worker.scheduled(controller, env, ctx)).resolves.toBeUndefined();
+    await waitOnExecutionContext(ctx);
+
+    expect(batches).toHaveLength(0);
+    expect(stub.alertCalls()).toHaveLength(1);
+    expect(stub.bodyOf(stub.alertCalls()[0]!)).toContain("no active zips");
+    expect(errors.mock.calls.flat().join("\n")).toContain("no active zips");
+    errors.mockRestore();
   });
 
   it("alerts and then RETHROWS when the producer fails", async () => {
@@ -649,5 +885,136 @@ describe("queue — the consumer", () => {
     expect(stub.alertCalls()).toHaveLength(0);
     expect(stub.subCalls()).toHaveLength(2);
     expect(await countPrices()).toBe(39);
+  });
+});
+
+// ===========================================================================
+// the validator must never throw — a throw would be caught as "transient"
+// by the outer handler and RETRIED, violating "malformed -> ack, never retry"
+// ===========================================================================
+
+describe("queue — bodies that break JSON.stringify are still acked, never retried", () => {
+  /** structuredClone carries BigInts through a queue; JSON.stringify throws on them. */
+  it("acks and alerts a body whose zip is a BigInt", async () => {
+    const stub = makeStub();
+    vi.stubGlobal("fetch", stub.impl);
+
+    const { batch, acked, retried } = fakeBatch([
+      { zip: 1n, scrape_date: SCRAPE_DATE },
+    ]);
+    const ctx = createExecutionContext();
+    await worker.queue(batch, baseEnv, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(acked).toEqual([0]);
+    expect(retried).toEqual([]);
+    expect(stub.alertCalls()).toHaveLength(1);
+    expect(stub.bodyOf(stub.alertCalls()[0]!)).toContain("not a 5-digit zip");
+    expect(stub.siteCalls()).toHaveLength(0);
+  });
+
+  it("acks and alerts a body whose zip is a cyclic object", async () => {
+    const stub = makeStub();
+    vi.stubGlobal("fetch", stub.impl);
+
+    const cyclic: Record<string, unknown> = { name: "loop" };
+    cyclic["self"] = cyclic;
+
+    const { batch, acked, retried } = fakeBatch([
+      { zip: cyclic, scrape_date: SCRAPE_DATE },
+    ]);
+    const ctx = createExecutionContext();
+    await worker.queue(batch, baseEnv, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(acked).toEqual([0]);
+    expect(retried).toEqual([]);
+    expect(stub.alertCalls()).toHaveLength(1);
+    expect(stub.bodyOf(stub.alertCalls()[0]!)).toContain("not a 5-digit zip");
+    expect(stub.siteCalls()).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// a failed alert leaves evidence in the logs — the only backstop there is
+// ===========================================================================
+
+describe("queue — an alert that could not be delivered", () => {
+  it("still ACKS the branch and logs ALERT_DELIVERY_FAILED", async () => {
+    await seed(null);
+    // The site serves a listing-free page (so queue() alerts) and ntfy 500s
+    // (so the alert itself fails). Nothing throws; the log is the whole record.
+    const stub = makeStub({ html: strippedFixture, ntfyStatus: 500 });
+    vi.stubGlobal("fetch", stub.impl);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { batch, acked, retried } = fakeBatch([message()]);
+    const ctx = createExecutionContext();
+    await worker.queue(batch, baseEnv, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(acked).toEqual([0]);
+    expect(retried).toEqual([]);
+    expect(stub.alertCalls()).toHaveLength(1);
+
+    const logged = errors.mock.calls.flat().join("\n");
+    expect(logged).toContain("ALERT_DELIVERY_FAILED");
+    expect(logged).toContain(`zip=${ZIP}`);
+    errors.mockRestore();
+  });
+});
+
+// ===========================================================================
+// the real runtime, not hand-written spies
+// ===========================================================================
+
+describe("queue — driven through the real cloudflare:test message batch", () => {
+  it("reports the genuine ack/retry outcome for a healthy zip and a failing one", async () => {
+    await baseEnv.DB.batch([
+      baseEnv.DB.prepare("INSERT INTO zips (zip, active) VALUES ('06483', 1)"),
+      baseEnv.DB.prepare("INSERT INTO zips (zip, active) VALUES ('06611', 1)"),
+    ]);
+
+    // 06611 resolves and serves the fixture; 06483 500s on both fetch paths.
+    const impl = (async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith(`${NTFY}/`)) return new Response(null, { status: 200 });
+      if (url === POST_URL) {
+        return zipFromPostBody(init) === "06611"
+          ? new Response(null, {
+              status: 302,
+              headers: { Location: "/trumbull_ct_oil_prices/06611" },
+            })
+          : new Response(null, { status: 500 });
+      }
+      if (url === `${BASE}/trumbull_ct_oil_prices/06611`) {
+        return new Response(fixture, { status: 200 });
+      }
+      return new Response(null, { status: 500 });
+    }) as unknown as typeof fetch;
+    vi.stubGlobal("fetch", impl);
+
+    // A real MessageBatch from the workerd runtime, whose ack()/retry() state is
+    // read back by the runtime itself rather than by a spy this file wrote.
+    const batch = createMessageBatch<ScrapeMessage>("heating-oil-scrape", [
+      { id: "real-fetch-fail", timestamp: new Date(0), attempts: 1, body: message("06483") },
+      { id: "real-healthy", timestamp: new Date(0), attempts: 1, body: message("06611") },
+    ]);
+    const ctx = createExecutionContext();
+    await worker.queue(batch, baseEnv, ctx);
+
+    const result = await getQueueResult(batch, ctx);
+
+    expect(result.ackAll).toBe(false);
+    expect(result.explicitAcks).toEqual(["real-healthy"]);
+    expect(result.retryMessages.map((m: { msgId: string }) => m.msgId)).toEqual([
+      "real-fetch-fail",
+    ]);
+    expect(result.outcome).toBe("ok");
+
+    const row = await baseEnv.DB.prepare(
+      "SELECT COUNT(*) AS c FROM prices WHERE zip = '06611'",
+    ).first<{ c: number }>();
+    expect(row?.c).toBe(39);
   });
 });

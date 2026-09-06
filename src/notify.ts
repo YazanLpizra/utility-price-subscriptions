@@ -316,12 +316,18 @@ async function postToNtfy(
         Priority: String(msg.priority),
       },
       body: msg.body,
+      // A stalled ntfy connection would otherwise hold a queue invocation open
+      // against its 15-minute ceiling. `src/fetcher.ts` already bounds the site
+      // fetch the same way; ntfy is the shorter hop, so 10s is generous.
+      // The abort surfaces as a rejection, which the catch below turns into
+      // `false` — the never-throw guarantee is unchanged.
+      signal: AbortSignal.timeout(10_000),
     });
     return res.status >= 200 && res.status < 300;
   } catch {
     // PRD §8: a failed push must not lose data that is already written, so a
-    // transport failure is a `false`, never an exception. The topic is never
-    // logged — on unauthenticated ntfy it is the credential.
+    // transport failure — timeout included — is a `false`, never an exception.
+    // The topic is never logged: on unauthenticated ntfy it is the credential.
     return false;
   }
 }
