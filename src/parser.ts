@@ -372,6 +372,91 @@ function finaliseListing(draft: ListingDraft): ParsedListing {
  * Throws ParseError on a structurally broken page.
  * Returns [] for a valid page with no listings.
  */
+/**
+ * Price-tier extraction by string scanning, deliberately NOT via HTMLRewriter.
+ *
+ * Profiling (see docs/cpu-measurement.md) showed the native tokenizer costs
+ * 0.33ms on this page while the JS callbacks cost ~17ms — one crossing per text
+ * node, and a single `td` text handler alone was ~5ms of that. The ~80 price
+ * cells are the bulk of those nodes, so they are read here instead: one linear
+ * pass over a string we already hold in memory, with no boundary crossings.
+ *
+ * PRD §9.2 chose HTMLRewriter over Cheerio on the grounds that it "runs in
+ * native code rather than JS". That reasoning holds for the TOKENIZER and not
+ * for handler dispatch, which is what actually dominated. Structure, hidden
+ * inputs and metadata still go through HTMLRewriter; only the dense, highly
+ * regular price tables are scanned.
+ *
+ * The markup this relies on is narrow and asserted by the fixture tests: a
+ * `table` carrying class `paywithcash` or `paybycredit`, containing no nested
+ * table, whose cells are plain `<td>`s. Drift is caught by the tier-count and
+ * pairing rules in finaliseListing(), which raise ParseError rather than
+ * silently returning fewer prices.
+ */
+interface RawPriceTable {
+  payment: PaymentType;
+  cells: string[];
+}
+
+const PRICE_TABLE_OPEN = /<table\b[^>]*\bclass\s*=\s*["']([^"']*)["'][^>]*>/gi;
+
+/** Strips tags from one cell's inner HTML, e.g. `<b>Gallons:</b>` -> `Gallons:`. */
+function cellText(inner: string): string {
+  return norm(inner.indexOf("<") === -1 ? inner : inner.replace(/<[^>]*>/g, ""));
+}
+
+function extractCells(tableHtml: string): string[] {
+  const cells: string[] = [];
+  let i = 0;
+  for (;;) {
+    const open = tableHtml.indexOf("<td", i);
+    if (open === -1) break;
+    const gt = tableHtml.indexOf(">", open);
+    if (gt === -1) break;
+    const close = tableHtml.indexOf("</td", gt);
+    if (close === -1) break;
+    cells.push(cellText(tableHtml.slice(gt + 1, close)));
+    i = close + 4;
+  }
+  return cells;
+}
+
+/** Every cash/credit price table in document order. */
+export function extractPriceTables(html: string): RawPriceTable[] {
+  const tables: RawPriceTable[] = [];
+  PRICE_TABLE_OPEN.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = PRICE_TABLE_OPEN.exec(html)) !== null) {
+    const classes = match[1] ?? "";
+    const payment: PaymentType | null = /\bpaywithcash\b/i.test(classes)
+      ? "cash"
+      : /\bpaybycredit\b/i.test(classes)
+        ? "credit"
+        : null;
+    if (payment === null) continue;
+
+    const bodyStart = PRICE_TABLE_OPEN.lastIndex;
+    const bodyEnd = html.indexOf("</table", bodyStart);
+    if (bodyEnd === -1) {
+      throw new ParseError(
+        `price table ${tables.length} (${payment}) has no closing </table>`,
+        { tableIndex: tables.length },
+      );
+    }
+    const body = html.slice(bodyStart, bodyEnd);
+    // The pairing rule assumes a flat table. A nested table would make
+    // `</table>` land in the wrong place, so refuse rather than mis-pair.
+    if (body.indexOf("<table") !== -1) {
+      throw new ParseError(
+        `price table ${tables.length} (${payment}) contains a nested table`,
+        { tableIndex: tables.length },
+      );
+    }
+    tables.push({ payment, cells: extractCells(body) });
+  }
+  return tables;
+}
+
 export async function parseListingsPage(
   html: string,
 ): Promise<ParsedListing[]> {
@@ -388,6 +473,7 @@ export async function parseListingsPage(
   }
 
   const listings: ParsedListing[] = [];
+  const drafts: ListingDraft[] = [];
   let firstError: unknown = null;
 
   let listing: ListingDraft | null = null;
@@ -398,7 +484,6 @@ export async function parseListingsPage(
   // NEVER by text.lastInTextNode (see the module docblock / plan §1.4).
   let captionBuf = "";
   let valueBuf = "";
-  let cellBuf = "";
   let pendingCaption: string | null = null;
 
   const fail = (err: unknown) => {
@@ -416,12 +501,9 @@ export async function parseListingsPage(
           listing = null;
           form = null;
           pendingCaption = null;
-          if (draft === null) return;
-          try {
-            listings.push(finaliseListing(draft));
-          } catch (err) {
-            fail(err);
-          }
+          // Finalisation is deferred: the price cells arrive from
+          // extractPriceTables() after this pass completes.
+          if (draft !== null) drafts.push(draft);
         });
       },
     })
@@ -500,61 +582,68 @@ export async function parseListingsPage(
       },
     });
 
-  // Cell buffering WITHOUT a per-cell onEndTag.
-  //
-  // A results page has ~80 price-table cells, and registering an onEndTag on
-  // each one allocated ~80 closures per parse — which profiling showed to be
-  // the dominant cost of the whole consumer (the parse is ~19ms of a ~19ms
-  // budget; row-building and D1 are free by comparison).
-  //
-  // Instead a cell is flushed when the NEXT cell opens, and the final cell of a
-  // table is flushed by that table's end tag. There are 10 tables per page
-  // versus 80 cells, so this trades ~80 closures for ~10. Cell order within a
-  // table is preserved, which is all the pairing rule in §1.2 depends on.
-  let cellOpen = false;
-
-  const flushCell = () => {
-    if (!cellOpen) return;
-    cellOpen = false;
-    const target = form;
-    const value = norm(cellBuf);
-    cellBuf = "";
-    if (target !== null) (target as FormDraft).cells.push(value);
-  };
-
-  const cellHandlers = {
+  // Price cells are NOT read through HTMLRewriter — see extractPriceTables().
+  // The table handlers stay because they are element-only and therefore cheap;
+  // they record which payment table a form owns, which is then cross-checked
+  // against both the hidden enumtype input and the string-scanned table order.
+  rewriter.on("table.paywithcash", {
     element() {
-      if (form === null) return;
-      flushCell(); // close the previous cell, if any
-      cellOpen = true;
-      cellBuf = "";
-    },
-    text(chunk: Text) {
-      if (form === null || !cellOpen) return;
-      cellBuf += chunk.text;
-    },
-  };
-
-  const tableHandlers = (payment: PaymentType) => ({
-    element(el: Element) {
-      if (form !== null) (form as FormDraft).tableClass = payment;
-      // Flush the table's last cell; nothing else closes it.
-      el.onEndTag(() => {
-        flushCell();
-      });
+      if (form !== null) (form as FormDraft).tableClass = "cash";
     },
   });
-
-  rewriter.on("table.paywithcash", tableHandlers("cash"));
-  rewriter.on("table.paybycredit", tableHandlers("credit"));
-  rewriter.on("table.paywithcash td", cellHandlers);
-  rewriter.on("table.paybycredit td", cellHandlers);
+  rewriter.on("table.paybycredit", {
+    element() {
+      if (form !== null) (form as FormDraft).tableClass = "credit";
+    },
+  });
 
   // HTMLRewriter only runs against a Response body; draining it to completion
   // is what drives every handler above.
   await rewriter.transform(new Response(html)).arrayBuffer();
 
   if (firstError !== null) throw firstError;
+
+  // No listings is not an error — PRD §8 leaves that call to the caller, which
+  // logs and skips the day rather than writing a wrong one. Returning early
+  // also avoids raising a spurious table/form mismatch on a page that has
+  // price tables but no listing wrapper.
+  if (drafts.length === 0) return listings;
+
+  // Attach the string-scanned price cells. Each form contains exactly one price
+  // table, and both appear in document order, so the Nth table belongs to the
+  // Nth form. That correspondence is asserted rather than assumed.
+  const tables = extractPriceTables(html);
+  const formsInOrder: FormDraft[] = [];
+  for (const draft of drafts) formsInOrder.push(...draft.forms);
+
+  if (tables.length !== formsInOrder.length) {
+    throw new ParseError(
+      `found ${tables.length} price table(s) but ${formsInOrder.length} order ` +
+        `form(s); the two must correspond one to one`,
+      { tables: tables.length, forms: formsInOrder.length },
+    );
+  }
+
+  for (let i = 0; i < tables.length; i++) {
+    const table = tables[i] as RawPriceTable;
+    const target = formsInOrder[i] as FormDraft;
+    // The table's own class must agree with the class HTMLRewriter saw on the
+    // element it matched. A mismatch means the two passes disagree about
+    // document order, which would silently file prices under the wrong dealer.
+    if (target.tableClass !== null && target.tableClass !== table.payment) {
+      throw new ParseError(
+        `price table ${i} is "${table.payment}" but the form's table element ` +
+          `was "${target.tableClass}"; the scan and the parse disagree on order`,
+        { tableIndex: i },
+      );
+    }
+    target.cells = table.cells;
+  }
+
+  for (const draft of drafts) {
+    listings.push(finaliseListing(draft));
+  }
+
   return listings;
 }
 
