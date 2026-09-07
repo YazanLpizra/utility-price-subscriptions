@@ -94,7 +94,13 @@ export interface NotificationDecision {
   should_send: boolean;
 }
 
-/** Payload handed to the notification transport. */
+/**
+ * Payload handed to the notification transport.
+ *
+ * `tags` and `priority` are expressive rather than literal: Telegram ignores
+ * tags entirely and uses `priority <= 2` only to send silently. They are kept
+ * because they state the message's intent at the call site.
+ */
 export interface NotificationMessage {
   title: string;
   body: string;
@@ -136,12 +142,6 @@ export interface Env {
    * value means dedupe is on, which is the intended production behaviour.
    */
   NOTIFY_DEDUPE?: string;
-  /**
-   * Which transport delivers notifications. Only "telegram" is implemented;
-   * the field is kept so a second provider can be added without a schema or
-   * orchestration change.
-   */
-  NOTIFY_PROVIDER?: string;
   /**
    * Telegram bot token, supplied as a Cloudflare SECRET — never a var, never
    * committed. It appears in the request URL, so that URL is never logged.

@@ -15,7 +15,6 @@ export default defineConfig({
           // overwrites `wrangler secret put` on every deploy. In production it
           // is a secret; here it is a test-only binding.
           ALERT_DESTINATION: "9999999999",
-          NOTIFY_PROVIDER: "telegram",
           TELEGRAM_BOT_TOKEN: "123:TESTTOKEN",
           TELEGRAM_API_BASE: "https://api.telegram.org",
           // Tests always exercise the PRODUCTION dedupe behaviour, regardless

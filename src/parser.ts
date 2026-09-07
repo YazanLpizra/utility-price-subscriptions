@@ -395,66 +395,255 @@ function finaliseListing(draft: ListingDraft): ParsedListing {
  */
 interface RawPriceTable {
   payment: PaymentType;
+  /** dealerid read from the SAME form region as the prices — never joined by ordinal. */
+  dealerId: string | null;
+  enumType: string | null;
   cells: string[];
 }
 
-const PRICE_TABLE_OPEN = /<table\b[^>]*\bclass\s*=\s*["']([^"']*)["'][^>]*>/gi;
+/**
+ * Comment / raw-text spans that must be skipped, because text inside them is
+ * NOT markup. This is the difference between a scanner and a lexer, and it is
+ * not theoretical: a commented-out `<td>1-1</td><td>$0.01</td>` inside a price
+ * table was silently accepted as a real $0.01 price — exactly the misleading
+ * cheapest-price failure the PRD exists to prevent. Hand-maintained PHP
+ * comments rows out routinely.
+ */
+const SKIP_SPANS: Array<{ open: string; close: string }> = [
+  { open: "<!--", close: "-->" },
+  { open: "<script", close: "</script>" },
+  { open: "<style", close: "</style>" },
+];
+
+/**
+ * Blanks every comment / script / style span, preserving length.
+ *
+ * Blanking rather than deleting keeps every surviving offset identical to the
+ * original string. One linear pass, no regex, no backtracking.
+ */
+function maskNonMarkup(html: string): string {
+  const lower = html.toLowerCase();
+  let out: string[] | null = null;
+  let i = 0;
+
+  while (i < html.length) {
+    let bestStart = -1;
+    let bestEnd = -1;
+    for (const span of SKIP_SPANS) {
+      const start = lower.indexOf(span.open, i);
+      if (start === -1) continue;
+      if (bestStart !== -1 && start >= bestStart) continue;
+      let end = lower.indexOf(span.close, start + span.open.length);
+      // An unterminated comment or script swallows the rest of the document.
+      end = end === -1 ? html.length : end + span.close.length;
+      bestStart = start;
+      bestEnd = end;
+    }
+    if (bestStart === -1) break;
+    if (out === null) out = html.split("");
+    for (let k = bestStart; k < bestEnd; k++) out[k] = " ";
+    i = bestEnd;
+  }
+
+  return out === null ? html : out.join("");
+}
 
 /** Strips tags from one cell's inner HTML, e.g. `<b>Gallons:</b>` -> `Gallons:`. */
 function cellText(inner: string): string {
   return norm(inner.indexOf("<") === -1 ? inner : inner.replace(/<[^>]*>/g, ""));
 }
 
-function extractCells(tableHtml: string): string[] {
+const WS_RE = /\s/;
+
+/**
+ * Reads a tag's attribute value without a regex.
+ *
+ * Deliberately NOT `/attr\s*=\s*["']([^"']*)["']/`: that pattern backtracks
+ * quadratically on pathological input — measured at 1.1s for an 80KB run of
+ * `<table ` prefixes, and the 2MB input cap bounds bytes, not backtracking
+ * time. A malformed upstream page could burn the entire CPU budget before any
+ * alert could be sent. Handles quoted and unquoted values.
+ */
+function attrValue(tag: string, name: string): string | null {
+  const lower = tag.toLowerCase();
+  let i = 0;
+  for (;;) {
+    const at = lower.indexOf(name, i);
+    if (at === -1) return null;
+    // Must be preceded by whitespace so `class` does not match inside `xclass`.
+    const before = at === 0 ? " " : (tag[at - 1] as string);
+    let j = at + name.length;
+    while (j < tag.length && WS_RE.test(tag[j] as string)) j++;
+    if (!WS_RE.test(before) || tag[j] !== "=") {
+      i = at + name.length;
+      continue;
+    }
+    j++;
+    while (j < tag.length && WS_RE.test(tag[j] as string)) j++;
+    const quote = tag[j];
+    if (quote === '"' || quote === "'") {
+      const end = tag.indexOf(quote, j + 1);
+      return end === -1 ? null : tag.slice(j + 1, end);
+    }
+    let end = j;
+    while (end < tag.length && !WS_RE.test(tag[end] as string) && tag[end] !== ">") end++;
+    return tag.slice(j, end);
+  }
+}
+
+/**
+ * Price-tier extraction by string scanning, deliberately NOT via HTMLRewriter.
+ *
+ * WHY: profiling (docs/cpu-measurement.md) showed the native tokenizer costs
+ * 0.33ms on this page while handing every text node to JS cost ~17ms — a single
+ * `td` text handler alone was ~5ms. The ~80 price cells are the bulk of those
+ * text nodes.
+ *
+ * WHAT MAKES IT SAFE:
+ *   1. Comments, script and style spans are masked first, so text that is not
+ *      markup can never become a price.
+ *   2. Each price table is read from INSIDE its own `tranction.php` form, and
+ *      the `dealerid` for those prices comes from that same region. Prices and
+ *      dealer identity therefore travel together in one contiguous span and are
+ *      never associated by ordinal position across two independent parses.
+ *   3. Tag matching is case-insensitive; every scan is a linear `indexOf` walk
+ *      with no backtracking regex on the hot path.
+ *   4. It fails closed: an unterminated tag, a nested table, or an odd cell
+ *      count raises ParseError rather than returning a short table that
+ *      `finaliseListing` would happily accept.
+ */
+export function extractPriceTables(html: string): RawPriceTable[] {
+  const masked = maskNonMarkup(html);
+  const lower = masked.toLowerCase();
+  const tables: RawPriceTable[] = [];
+
+  let cursor = 0;
+  for (;;) {
+    const formAt = lower.indexOf("<form", cursor);
+    if (formAt === -1) break;
+    const formTagEnd = masked.indexOf(">", formAt);
+    if (formTagEnd === -1) break;
+    const formTag = masked.slice(formAt, formTagEnd + 1);
+    cursor = formTagEnd + 1;
+
+    const action = attrValue(formTag, "action");
+    if (action === null || !action.toLowerCase().includes("tranction.php")) continue;
+
+    let formEnd = lower.indexOf("</form", formTagEnd);
+    if (formEnd === -1) formEnd = masked.length;
+    const region = masked.slice(formTagEnd + 1, formEnd);
+    cursor = formEnd;
+
+    const table = readPriceTable(region, tables.length);
+    if (table !== null) tables.push(table);
+  }
+
+  return tables;
+}
+
+/** Reads the single price table inside one order form's region. */
+function readPriceTable(region: string, index: number): RawPriceTable | null {
+  const lower = region.toLowerCase();
+
+  const tableAt = lower.indexOf("<table");
+  if (tableAt === -1) return null;
+  const tableTagEnd = region.indexOf(">", tableAt);
+  if (tableTagEnd === -1) {
+    throw new ParseError(`price table ${index}: unterminated <table> tag`, { index });
+  }
+  const classes = attrValue(region.slice(tableAt, tableTagEnd + 1), "class") ?? "";
+  const padded = ` ${classes.toLowerCase().replace(/\s+/g, " ")} `;
+  const payment: PaymentType | null = padded.includes(" paywithcash ")
+    ? "cash"
+    : padded.includes(" paybycredit ")
+      ? "credit"
+      : null;
+  if (payment === null) return null;
+
+  const tableEnd = lower.indexOf("</table", tableTagEnd);
+  if (tableEnd === -1) {
+    throw new ParseError(
+      `price table ${index} (${payment}) has no closing </table>`,
+      { index },
+    );
+  }
+  const body = region.slice(tableTagEnd + 1, tableEnd);
+  if (body.toLowerCase().indexOf("<table") !== -1) {
+    throw new ParseError(
+      `price table ${index} (${payment}) contains a nested table`,
+      { index },
+    );
+  }
+
+  return {
+    payment,
+    dealerId: hiddenInputValue(region, "dealerid"),
+    enumType: hiddenInputValue(region, "enumtype"),
+    cells: extractCells(body, index, payment),
+  };
+}
+
+/** Value of `<input name="NAME" value="...">` within one form region. */
+function hiddenInputValue(region: string, name: string): string | null {
+  const lower = region.toLowerCase();
+  let i = 0;
+  for (;;) {
+    const at = lower.indexOf("<input", i);
+    if (at === -1) return null;
+    const end = region.indexOf(">", at);
+    if (end === -1) return null;
+    const tag = region.slice(at, end + 1);
+    i = end + 1;
+    if ((attrValue(tag, "name") ?? "").toLowerCase() === name) {
+      return attrValue(tag, "value");
+    }
+  }
+}
+
+function extractCells(
+  tableHtml: string,
+  index: number,
+  payment: PaymentType,
+): string[] {
+  const lower = tableHtml.toLowerCase();
   const cells: string[] = [];
   let i = 0;
   for (;;) {
-    const open = tableHtml.indexOf("<td", i);
+    const open = lower.indexOf("<td", i);
     if (open === -1) break;
+    // Reject `<tdfoo`; a real cell is `<td>` or `<td ...>`.
+    const after = tableHtml[open + 3];
+    if (after !== undefined && after !== ">" && !WS_RE.test(after)) {
+      i = open + 3;
+      continue;
+    }
     const gt = tableHtml.indexOf(">", open);
-    if (gt === -1) break;
-    const close = tableHtml.indexOf("</td", gt);
-    if (close === -1) break;
+    if (gt === -1) {
+      throw new ParseError(
+        `price table ${index} (${payment}): unterminated <td> tag`,
+        { index },
+      );
+    }
+    const close = lower.indexOf("</td", gt);
+    if (close === -1) {
+      // Fail closed. A missing </td> used to end the loop quietly, truncating
+      // the table while finaliseListing still accepted the surviving tiers.
+      throw new ParseError(
+        `price table ${index} (${payment}): <td> with no </td>`,
+        { index },
+      );
+    }
     cells.push(cellText(tableHtml.slice(gt + 1, close)));
     i = close + 4;
   }
-  return cells;
-}
-
-/** Every cash/credit price table in document order. */
-export function extractPriceTables(html: string): RawPriceTable[] {
-  const tables: RawPriceTable[] = [];
-  PRICE_TABLE_OPEN.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = PRICE_TABLE_OPEN.exec(html)) !== null) {
-    const classes = match[1] ?? "";
-    const payment: PaymentType | null = /\bpaywithcash\b/i.test(classes)
-      ? "cash"
-      : /\bpaybycredit\b/i.test(classes)
-        ? "credit"
-        : null;
-    if (payment === null) continue;
-
-    const bodyStart = PRICE_TABLE_OPEN.lastIndex;
-    const bodyEnd = html.indexOf("</table", bodyStart);
-    if (bodyEnd === -1) {
-      throw new ParseError(
-        `price table ${tables.length} (${payment}) has no closing </table>`,
-        { tableIndex: tables.length },
-      );
-    }
-    const body = html.slice(bodyStart, bodyEnd);
-    // The pairing rule assumes a flat table. A nested table would make
-    // `</table>` land in the wrong place, so refuse rather than mis-pair.
-    if (body.indexOf("<table") !== -1) {
-      throw new ParseError(
-        `price table ${tables.length} (${payment}) contains a nested table`,
-        { tableIndex: tables.length },
-      );
-    }
-    tables.push({ payment, cells: extractCells(body) });
+  if (cells.length % 2 !== 0) {
+    throw new ParseError(
+      `price table ${index} (${payment}) has an odd cell count (${cells.length}); ` +
+        `the gallons/price pairing rule needs pairs`,
+      { index, cells: cells.length },
+    );
   }
-  return tables;
+  return cells;
 }
 
 export async function parseListingsPage(
@@ -609,12 +798,27 @@ export async function parseListingsPage(
   // price tables but no listing wrapper.
   if (drafts.length === 0) return listings;
 
-  // Attach the string-scanned price cells. Each form contains exactly one price
-  // table, and both appear in document order, so the Nth table belongs to the
-  // Nth form. That correspondence is asserted rather than assumed.
+  // Attach the string-scanned price cells.
+  //
+  // The scan reads each price table from inside its own `tranction.php` form and
+  // carries that form's OWN dealerid and enumtype alongside the cells, so prices
+  // and dealer identity already travel together. What follows is therefore a
+  // cross-check between two independent parses, not the thing that establishes
+  // ownership: position must agree, and so must dealerid and payment type.
+  //
+  // An earlier version joined purely on ordinal position and asserted only the
+  // counts and the table class. That is not sufficient — markup that shifts the
+  // sequence by one can satisfy both and file every dealer's prices under the
+  // preceding dealer.
   const tables = extractPriceTables(html);
-  const formsInOrder: FormDraft[] = [];
-  for (const draft of drafts) formsInOrder.push(...draft.forms);
+  // Each form remembers which listing it belongs to, so an error can name the
+  // listing a human would look for, not just a table ordinal.
+  const formsInOrder: Array<{ form: FormDraft; listingIndex: number }> = [];
+  for (const draft of drafts) {
+    for (const form of draft.forms) {
+      formsInOrder.push({ form, listingIndex: draft.index });
+    }
+  }
 
   if (tables.length !== formsInOrder.length) {
     throw new ParseError(
@@ -626,17 +830,51 @@ export async function parseListingsPage(
 
   for (let i = 0; i < tables.length; i++) {
     const table = tables[i] as RawPriceTable;
-    const target = formsInOrder[i] as FormDraft;
-    // The table's own class must agree with the class HTMLRewriter saw on the
-    // element it matched. A mismatch means the two passes disagree about
-    // document order, which would silently file prices under the wrong dealer.
+    const owner = formsInOrder[i] as { form: FormDraft; listingIndex: number };
+    const target = owner.form;
+    const where = `listing index ${owner.listingIndex} / price table ${i}`;
+
     if (target.tableClass !== null && target.tableClass !== table.payment) {
       throw new ParseError(
-        `price table ${i} is "${table.payment}" but the form's table element ` +
-          `was "${target.tableClass}"; the scan and the parse disagree on order`,
-        { tableIndex: i },
+        `${where} is "${table.payment}" but the form's table element was ` +
+          `"${target.tableClass}"; the scan and the parse disagree on order`,
+        { tableIndex: i, listingIndex: owner.listingIndex },
       );
     }
+
+    // The decisive check: the dealerid the SCAN read from this form region must
+    // be the dealerid HTMLRewriter read from the same form. If the two parses
+    // have drifted out of step, these differ and we refuse rather than publish
+    // one dealer's prices under another's identity.
+    const scannedDealer = table.dealerId;
+    const parsedDealer = target.dealerIds[0] ?? null;
+    if (scannedDealer !== null && parsedDealer !== null && scannedDealer !== parsedDealer) {
+      throw new ParseError(
+        `${where} carries dealerid "${scannedDealer}" but the parsed form carries ` +
+          `"${parsedDealer}"; the scan and the parse disagree on which dealer ` +
+          `these prices belong to`,
+        { tableIndex: i, listingIndex: owner.listingIndex, scannedDealer, parsedDealer },
+      );
+    }
+    if (scannedDealer === null || parsedDealer === null) {
+      throw new ParseError(
+        `${where} could not be tied to a dealerid by both passes ` +
+          `(scan=${String(scannedDealer)}, parse=${String(parsedDealer)})`,
+        { tableIndex: i, listingIndex: owner.listingIndex },
+      );
+    }
+
+    // Same for payment type, read independently from the form's enumtype input.
+    const scannedType =
+      table.enumType === null ? null : normaliseEnumType(table.enumType);
+    if (scannedType !== null && scannedType !== table.payment) {
+      throw new ParseError(
+        `${where} has enumtype "${scannedType}" but table class ` +
+          `"${table.payment}"`,
+        { tableIndex: i, listingIndex: owner.listingIndex },
+      );
+    }
+
     target.cells = table.cells;
   }
 

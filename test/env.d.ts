@@ -10,7 +10,6 @@ declare namespace Cloudflare {
      */
     ALERT_DESTINATION: string;
     NOTIFY_DEDUPE: string;
-    NOTIFY_PROVIDER?: string;
     TELEGRAM_BOT_TOKEN?: string;
     TELEGRAM_API_BASE?: string;
   }

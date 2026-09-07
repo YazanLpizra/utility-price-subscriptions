@@ -11,7 +11,7 @@
  * actively misleading.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildNotification,
   evaluateSubscription,
@@ -146,7 +146,6 @@ const env: Env = {
   SITE_BASE_URL: "https://www.cashheatingoil.com",
   ALERT_DESTINATION: "5838650961",
   STALE_AFTER_DAYS: "3",
-  NOTIFY_PROVIDER: "telegram",
   TELEGRAM_BOT_TOKEN: "123:ABC",
   TELEGRAM_API_BASE: "https://api.telegram.org",
   USER_AGENT: "heating-oil-tracker/1.0 (test)",
@@ -481,8 +480,7 @@ describe("telegram transport", () => {
   const msg = { title: "T", body: "B", tags: ["fuelpump"], priority: 3 };
   const tg: Env = {
     ...env,
-    NOTIFY_PROVIDER: "telegram",
-    TELEGRAM_BOT_TOKEN: "123:ABC",
+      TELEGRAM_BOT_TOKEN: "123:ABC",
     TELEGRAM_API_BASE: "https://api.telegram.org",
   };
 
@@ -556,10 +554,72 @@ describe("telegram transport", () => {
     expect(body.text).toContain("parse failed");
   });
 
-  it("routes through Telegram even when NOTIFY_PROVIDER is unset", async () => {
+  it("routes every message through Telegram", async () => {
     const { impl, calls } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
-    const noProvider: Env = { ...tg, NOTIFY_PROVIDER: undefined };
-    expect(await sendNotification(noProvider, "5838650961", msg, impl)).toBe(true);
+    expect(await sendNotification(tg, "5838650961", msg, impl)).toBe(true);
     expect(calls[0]!.url).toContain("/sendMessage");
+  });
+});
+
+// ------------------------------------------------- transport hardening
+
+describe("transport hardening", () => {
+  const msg = { title: "T", body: "B", tags: [], priority: 3 };
+  const tgEnv: Env = { ...env, TELEGRAM_BOT_TOKEN: "123:SECRETTOKEN" };
+
+  it("never logs the bot token, even when the transport throws with the URL in it", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const impl = (async () => {
+      throw new Error(
+        "fetch failed for https://api.telegram.org/bot123:SECRETTOKEN/sendMessage",
+      );
+    }) as unknown as typeof fetch;
+    await expect(sendNotification(tgEnv, "5838650961", msg, impl)).resolves.toBe(false);
+    const logged = errors.mock.calls.flat().join("\n");
+    expect(logged).not.toContain("SECRETTOKEN");
+    expect(logged).toContain("[telegram]");
+    errors.mockRestore();
+  });
+
+  it("never logs the bot token when the API rejects the send", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { impl } = stubFetch(() => new Response('{"ok":false}', { status: 400 }));
+    await sendNotification(tgEnv, "5838650961", msg, impl);
+    expect(errors.mock.calls.flat().join("\n")).not.toContain("SECRETTOKEN");
+    errors.mockRestore();
+  });
+
+  it("truncates text over Telegram's 4096-character limit", async () => {
+    const { impl, calls } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
+    const huge = { ...msg, body: "x".repeat(9000) };
+    expect(await sendNotification(tgEnv, "5838650961", huge, impl)).toBe(true);
+    const text = JSON.parse(String(calls[0]!.init?.body)).text as string;
+    expect(Array.from(text).length).toBeLessThanOrEqual(4096);
+    expect(text.endsWith("[truncated]")).toBe(true);
+  });
+
+  it("does not split a surrogate pair when truncating", async () => {
+    const { impl, calls } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
+    const huge = { ...msg, body: "🔥".repeat(5000) };
+    await sendNotification(tgEnv, "5838650961", huge, impl);
+    const text = JSON.parse(String(calls[0]!.init?.body)).text as string;
+    expect(text).not.toContain("\uFFFD");
+    expect(/[\uD800-\uDBFF]$/.test(text.replace("[truncated]", ""))).toBe(false);
+  });
+
+  describe("rejects chat ids Telegram itself would reject", () => {
+    for (const bad of ["0", "-0", "00", "99999999999999999999", "007"]) {
+      it(JSON.stringify(bad), async () => {
+        const { impl, calls } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
+        expect(await sendNotification(tgEnv, bad, msg, impl)).toBe(false);
+        expect(calls).toHaveLength(0);
+      });
+    }
+  });
+
+  it("still accepts a real chat id and a negative group id", async () => {
+    const { impl } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
+    expect(await sendNotification(tgEnv, "5838650961", msg, impl)).toBe(true);
+    expect(await sendNotification(tgEnv, "-1001234567890", msg, impl)).toBe(true);
   });
 });

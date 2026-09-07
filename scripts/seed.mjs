@@ -33,7 +33,9 @@ const SEED_FILE = join(ROOT, "seeds", "dev-seed.sql");
 
 const ZIP_RE = /^\d{5}$/;
 /** A Telegram chat id: digits, optionally negative for groups and channels. */
-const DESTINATION_RE = /^-?\d{1,20}$/;
+const DESTINATION_RE = /^-?[1-9]\d{0,18}$/;
+/** Telegram ids fit in 52 significant bits; the CLI must not approve what the API will reject. */
+const MAX_CHAT_ID = 2n ** 52n;
 const THRESHOLD_RE = /^\d+(\.\d{1,2})?$/;
 const PAYMENT_TYPES = new Set(["cash", "credit"]);
 const MAX_GALLONS = 100000;
@@ -48,7 +50,15 @@ function validZip(value) {
 }
 
 function validDestination(value) {
-  if (typeof value !== "string" || !DESTINATION_RE.test(value)) {
+  const inRange = (v) => {
+    try {
+      const magnitude = BigInt(v.startsWith("-") ? v.slice(1) : v);
+      return magnitude > 0n && magnitude < MAX_CHAT_ID;
+    } catch {
+      return false;
+    }
+  };
+  if (typeof value !== "string" || !DESTINATION_RE.test(value) || !inRange(value)) {
     throw new UsageError(
       `invalid destination ${JSON.stringify(value ?? "")}: expected a Telegram chat id (digits, optionally negative)`,
     );

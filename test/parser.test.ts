@@ -11,6 +11,7 @@
 import { describe, expect, it } from "vitest";
 import fixture from "./fixtures/06483.html?raw";
 import {
+  extractPriceTables,
   ParseError,
   parseHumanDate,
   parseListingsPage,
@@ -392,5 +393,95 @@ describe("parseHumanDate", () => {
 
   it("tolerates the NBSP padding the site actually emits", () => {
     expect(parseHumanDate(" Sep 5th 2026 ")).toBe("2026-09-05");
+  });
+});
+
+// ------------------------------------------------- adversarial markup (scanner)
+
+/**
+ * These exist because the price cells are read by a string scanner rather than
+ * by HTMLRewriter, and a scanner that is not HTML-aware fails in ways a parser
+ * does not. Every case below was a REAL defect found by review, not a
+ * hypothetical: the commented-cell case produced a bogus $0.01 "cheapest"
+ * price, and the regex case burned 1.1s of CPU on 80KB of input.
+ */
+describe("adversarial markup", () => {
+  it("ignores a <td> commented out INSIDE a price table", async () => {
+    const injected = fixture.replace(
+      "<td>100-149</td>",
+      "<!-- <td>1-1</td><td>$0.01</td> --><td>100-149</td>",
+    );
+    const listings = await parseListingsPage(injected);
+    const total = listings.reduce((n, l) => n + l.tiers.length, 0);
+    expect(total).toBe(EXPECTED_TOTAL);
+    const cheapest = Math.min(
+      ...listings.flatMap((l) => l.tiers.map((t) => t.price_per_gallon)),
+    );
+    expect(cheapest).toBe(4.84);
+  });
+
+  it("ignores a whole price table that is commented out", async () => {
+    const fake =
+      '<!-- <form action="tranction.php"><input name="dealerid" value="1"/>' +
+      '<table class="paywithcash"><tr><td>1-9</td><td>$0.01</td></tr></table></form> -->';
+    const listings = await parseListingsPage(fake + fixture);
+    expect(listings.length).toBe(5);
+    expect(listings.reduce((n, l) => n + l.tiers.length, 0)).toBe(EXPECTED_TOTAL);
+  });
+
+  it("ignores <td> inside a <script> block", async () => {
+    const injected = fixture.replace(
+      "<td>100-149</td>",
+      '<script>var x = "<td>1-1</td><td>$0.01</td>";</script><td>100-149</td>',
+    );
+    const listings = await parseListingsPage(injected);
+    expect(listings.reduce((n, l) => n + l.tiers.length, 0)).toBe(EXPECTED_TOTAL);
+  });
+
+  it("handles uppercase tags", async () => {
+    const injected = fixture.replace(/<table class="paywithcash"/g, '<TABLE CLASS="paywithcash"');
+    const listings = await parseListingsPage(injected);
+    expect(listings.reduce((n, l) => n + l.tiers.length, 0)).toBe(EXPECTED_TOTAL);
+  });
+
+  it("handles an unquoted class attribute", async () => {
+    const injected = fixture.replace('class="paywithcash"', "class=paywithcash");
+    const listings = await parseListingsPage(injected);
+    expect(listings.reduce((n, l) => n + l.tiers.length, 0)).toBe(EXPECTED_TOTAL);
+  });
+
+  it("rejects a <td> with no closing tag rather than truncating the table", async () => {
+    const injected = fixture.replace("<td>200-299</td>", "<td>200-299");
+    await expect(parseListingsPage(injected)).rejects.toBeInstanceOf(ParseError);
+  });
+
+  it("rejects a price table containing a nested table", async () => {
+    const injected = fixture.replace(
+      "<td>100-149</td>",
+      "<td><table><tr><td>x</td></tr></table></td>",
+    );
+    await expect(parseListingsPage(injected)).rejects.toBeInstanceOf(ParseError);
+  });
+
+  it("rejects a page whose dealerids disagree between the two passes", async () => {
+    // Change the dealerid only where the SCAN reads it (inside the form), so the
+    // scan and HTMLRewriter end up disagreeing about who owns these prices.
+    let seen = 0;
+    const injected = fixture.replace(/value="372"/g, (m) => {
+      seen++;
+      return seen === 1 ? 'value="99999"' : m;
+    });
+    expect(seen).toBeGreaterThan(0);
+    await expect(parseListingsPage(injected)).rejects.toThrow(/dealerid|disagree/i);
+  });
+
+  it("scans pathological input in linear time", () => {
+    // The previous regex took 1105ms on 80KB of `<table ` prefixes; the 2MB
+    // input cap bounds bytes, not backtracking, so this was a real way to burn
+    // the whole CPU budget before any alert could be sent.
+    const evil = "<table ".repeat((320 * 1024) / 7);
+    const started = performance.now();
+    extractPriceTables(evil);
+    expect(performance.now() - started).toBeLessThan(250);
   });
 });

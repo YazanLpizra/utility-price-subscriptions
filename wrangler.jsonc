@@ -12,12 +12,14 @@
   "vars": {
     "SITE_BASE_URL": "https://www.cashheatingoil.com",
     "STALE_AFTER_DAYS": "3",
-    // Transport. TELEGRAM_BOT_TOKEN and ALERT_DESTINATION are SECRETS, set with
+    // Transport secrets (TELEGRAM_BOT_TOKEN, ALERT_DESTINATION) are set with
     // `wrangler secret put` — never vars here, because a var of the same name
     // shares the binding namespace and overwrites the secret on every deploy.
-    "NOTIFY_PROVIDER": "telegram",
     "USER_AGENT": "heating-oil-tracker/1.0 (+personal price tracker)"
   },
+  // Fail the deploy if either secret is missing, rather than deploying a Worker
+  // that scrapes correctly and then silently fails every send.
+  "secrets": { "required": ["TELEGRAM_BOT_TOKEN", "ALERT_DESTINATION"] },
   "d1_databases": [
     {
       "binding": "DB",

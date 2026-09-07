@@ -284,7 +284,28 @@ export function notificationFingerprint(decision: NotificationDecision): string 
  * Validated because it is user-supplied data read out of D1 and interpolated
  * into a request body.
  */
-const CHAT_ID_RE = /^-?\d{1,20}$/;
+const CHAT_ID_RE = /^-?[1-9]\d{0,18}$/;
+
+/** Telegram ids fit in 52 significant bits. */
+const MAX_CHAT_ID = 2n ** 52n;
+
+function isValidChatId(value: string): boolean {
+  const trimmed = value.trim();
+  if (!CHAT_ID_RE.test(trimmed)) return false;
+  const magnitude = BigInt(trimmed < "0" ? trimmed.slice(1) : trimmed);
+  return magnitude > 0n && magnitude < MAX_CHAT_ID;
+}
+
+/** Telegram's documented maximum for `sendMessage.text`. */
+const MAX_TEXT_CHARS = 4096;
+const TRUNCATION_MARK = "\n[truncated]";
+
+function truncateText(text: string): string {
+  const points = Array.from(text);
+  if (points.length <= MAX_TEXT_CHARS) return text;
+  const keep = MAX_TEXT_CHARS - Array.from(TRUNCATION_MARK).length;
+  return points.slice(0, keep).join("") + TRUNCATION_MARK;
+}
 
 /**
  * Telegram transport.
@@ -313,7 +334,7 @@ async function postToTelegram(
     console.error("[telegram] no TELEGRAM_BOT_TOKEN configured; cannot send");
     return false;
   }
-  if (typeof chatId !== "string" || !CHAT_ID_RE.test(chatId.trim())) {
+  if (typeof chatId !== "string" || !isValidChatId(chatId)) {
     console.error("[telegram] refusing to send to a malformed chat id");
     return false;
   }
@@ -325,9 +346,11 @@ async function postToTelegram(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId.trim(),
-        text: `${msg.title}
-
-${msg.body}`,
+        // Telegram rejects text over 4096 characters with a 400. Alerts
+        // interpolate untrusted page content, so an unbounded message would
+        // make the very alert reporting markup drift vanish. Truncate by code
+        // point, not by UTF-16 unit, so a surrogate pair is never split.
+        text: truncateText(`${msg.title}\n\n${msg.body}`),
         disable_notification: msg.priority <= 2,
       }),
       signal: AbortSignal.timeout(10_000),
@@ -345,8 +368,11 @@ ${msg.body}`,
     );
     return false;
   } catch (err) {
+    // Deliberately NOT err.message: a runtime/fetch error can embed the request
+    // URL, and the bot token is IN that URL. Only the error's class name is
+    // logged, which is enough to tell a timeout from a network failure.
     console.error(
-      `[telegram] send threw: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`,
+      `[telegram] send threw: ${err instanceof Error ? err.name : typeof err}`,
     );
     return false;
   }
