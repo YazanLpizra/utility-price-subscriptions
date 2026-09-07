@@ -5,3 +5,4 @@
 # also renormalise docs/view-source_*.html, which is the extractor's input and
 # must stay byte-for-byte as captured.
 /test/fixtures/06483.html text eol=lf
+/test/fixtures/06483-2026-09-07.html text eol=lf

@@ -10,6 +10,7 @@
 
 import { describe, expect, it } from "vitest";
 import fixture from "./fixtures/06483.html?raw";
+import liveFixture from "./fixtures/06483-2026-09-07.html?raw";
 import {
   extractPriceTables,
   ParseError,
@@ -483,5 +484,50 @@ describe("adversarial markup", () => {
     const started = performance.now();
     extractPriceTables(evil);
     expect(performance.now() - started).toBeLessThan(250);
+  });
+});
+
+// ------------------------------------------------- a second, real capture
+
+/**
+ * A live capture from 2026-09-07, two days after the fixture of record.
+ *
+ * Its shape genuinely differs — SIX dealers instead of five, a dealer id that
+ * did not exist before (1039), and 47 price points instead of 39 — so it proves
+ * the parser is not overfitted to one page. It also pins the behaviour that
+ * production actually exhibited: the deployed Worker wrote exactly these 47
+ * rows on the same day.
+ *
+ * Not a substitute for the fixture of record: that one is the frozen contract
+ * with known-good values from the PRD. This one is evidence the contract
+ * survives real markup drift.
+ */
+describe("second real capture (2026-09-07)", () => {
+  it("parses a six-dealer page into 47 price points", async () => {
+    const listings = await parseListingsPage(liveFixture);
+    expect(listings.length).toBe(6);
+    expect(listings.map((l) => l.dealer_id)).toEqual([1039, 744, 11, 372, 345, 919]);
+    expect(listings.reduce((n, l) => n + l.tiers.length, 0)).toBe(47);
+  });
+
+  it("reads that day's metadata, and reports it as fresh", async () => {
+    const listings = await parseListingsPage(liveFixture);
+    for (const l of listings) {
+      expect(l.price_updated_on).toBe("2026-09-07");
+      expect(l.same_day_charge).toBe(0);
+    }
+  });
+
+  it("produces only well-formed rows", async () => {
+    const listings = await parseListingsPage(liveFixture);
+    const rows = toPriceRows(listings, "06483", "2026-09-07", "2026-09-07T14:00:00.000Z");
+    expect(rows.length).toBe(47);
+    for (const r of rows) {
+      expect(r.price_per_gallon).toBeGreaterThan(0);
+      expect(r.gallon_min).toBeGreaterThan(0);
+      expect(r.gallon_max === null || r.gallon_max >= r.gallon_min).toBe(true);
+      expect(["cash", "credit"]).toContain(r.payment_type);
+    }
+    expect(Math.min(...rows.map((r) => r.price_per_gallon))).toBe(4.8);
   });
 });
