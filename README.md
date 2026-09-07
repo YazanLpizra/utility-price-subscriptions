@@ -62,9 +62,12 @@ node scripts/seed.mjs --activate 06483
 ```
 
 Once `06483` is active, triggering the cron will POST to `cashheatingoil.com` (or GET its cached
-slug) and, if a subscription qualifies, POST to whatever `ntfy_topic` is in that subscription's
-row in D1 (`heating-oil-local-dev` in the committed seed — a real, public, unauthenticated ntfy
-topic). Deactivate again with `node scripts/seed.mjs --deactivate 06483` when you're done.
+slug) and, if a subscription qualifies, POST to the Telegram Bot API for whatever `destination`
+(chat id) is in that subscription's row in D1. The committed seed uses `5551234567`, a placeholder
+chat id — sending to it will fail (Telegram will reject it), which is harmless locally since no
+`TELEGRAM_BOT_TOKEN` is configured by default anyway (see [Environment
+variables](#environment-variables-env-srctypests)). Deactivate again with `node scripts/seed.mjs
+--deactivate 06483` when you're done.
 
 ## Exercising the Worker locally
 
@@ -117,18 +120,20 @@ strict grammar before issuing any SQL (see `node scripts/seed.mjs --help`):
 node scripts/seed.mjs --add-zip 06611
 node scripts/seed.mjs --activate 06611
 node scripts/seed.mjs --deactivate 06611
-node scripts/seed.mjs --add-sub 06483 my-ntfy-topic 100 cash
-node scripts/seed.mjs --add-sub 06483 my-ntfy-topic 50 credit 5.50
+node scripts/seed.mjs --add-sub 06483 123456789 100 cash
+node scripts/seed.mjs --add-sub 06483 123456789 50 credit 5.50
 ```
 
 - `--add-zip <zip>` — inserts a new zip, `active = 0` by default (never network-touching by
   itself). `<zip>` must be exactly 5 digits.
 - `--activate <zip>` / `--deactivate <zip>` — flips `active` for a zip already in the table.
   Activating causes real fetches on the next scheduled run (local or deployed).
-- `--add-sub <zip> <topic> <min_gallons> <cash|credit> [threshold]` — inserts or updates (by the
-  natural key `user_id, zip, ntfy_topic, payment_type, min_gallons`) a subscription. `<topic>`
-  must match `[A-Za-z0-9_-]{1,64}`; `<min_gallons>` a positive integer up to 100000; `[threshold]`
-  is optional, a positive decimal with at most 2 decimal places.
+- `--add-sub <zip> <chat-id> <min_gallons> <cash|credit> [threshold]` — inserts or updates (by the
+  natural key `user_id, zip, destination, payment_type, min_gallons`) a subscription. `<chat-id>`
+  is a Telegram chat id and must match `^-?\d{1,20}$` (digits, optionally negative for groups and
+  channels — see [Getting set up with Telegram](#getting-set-up-with-telegram) for how to find
+  one); `<min_gallons>` a positive integer up to 100000; `[threshold]` is optional, a positive
+  decimal with at most 2 decimal places.
 - Every command accepts `--dry-run` (prints the SQL, touches nothing) and defaults to `--local`;
   `--remote` requires `CONFIRM_REMOTE=1` in the environment as a safety interlock.
 - Running `node scripts/seed.mjs` with no flags re-applies `seeds/dev-seed.sql` (idempotent) and
@@ -146,7 +151,7 @@ cron (12:00 UTC, one trigger)
                  -> writePriceRows(): D1 batch — DELETE the day's rows for this zip, then
                     chunked multi-row INSERT ... ON CONFLICT DO UPDATE (replace, not upsert)
                  -> evaluateSubscription() per active subscription for that zip
-                 -> sendNtfy() for every subscription whose decision says to send
+                 -> sendNotification() for every subscription whose decision says to send
 ```
 
 **Why one zip per Queues message, rather than a loop over all zips in one invocation:** each
@@ -159,54 +164,96 @@ fresh budget, which is what makes the free tier's binding limits — CPU time an
 invocation — irrelevant to how many zips this project tracks (PRD §5.1). See
 `docs/implementation-plan.md` §2.4 and Phase 7 for the full accounting.
 
+## Why Telegram, not ntfy
+
+This project originally pushed notifications through [ntfy](https://ntfy.sh). That transport was
+removed. ntfy.sh meters anonymous publishing **per source IP**, and Cloudflare Workers egress
+from a shared pool of IPs whose daily quota is routinely already spent by other tenants — so
+production pushes came back `429 Too Many Requests` while the identical payload succeeded
+immediately from a home IP. An ntfy access token did **not** fix this: ntfy's `/v1/account`
+endpoint reports `limits.basis = "ip"` for free accounts, so metering stays keyed to the IP
+regardless of authentication. Telegram meters per bot token instead, which is exclusive to this
+project, so the same Worker-to-shared-IP problem does not apply. This is recorded here so nobody
+reintroduces ntfy expecting a token to be the missing piece — see `src/notify.ts` and
+`migrations/0002_notification_destination.sql` for the same rationale in the code.
+
+Messages are sent as an HTTP POST to `https://api.telegram.org/bot<TOKEN>/sendMessage` with a JSON
+body of `{ chat_id, text, disable_notification }`, as plain text with **no** `parse_mode` — prices
+contain `$`, `.` and `-`, all of which are MarkdownV2 metacharacters, and a formatting error would
+turn into a silent `400` rather than a delivered message.
+
+## Getting set up with Telegram
+
+1. Create a bot via [@BotFather](https://t.me/BotFather) (`/newbot`) and copy the bot token it
+   gives you.
+2. Message the bot once, from the Telegram account (or group) that should receive alerts.
+   Telegram will not reveal a chat id until the user initiates contact, and bots cannot message a
+   user first — so this step cannot be skipped or automated.
+3. Fetch `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser or with `curl` and read the
+   chat id out of the JSON response (`result[0].message.chat.id`). That is the value passed to
+   `--add-sub` and stored as `ALERT_DESTINATION`.
+
 ## Environment variables (`Env`, `src/types.ts`)
 
 | Var | Committed default (`wrangler.jsonc`) | Must change before deploy? |
 |---|---|---|
 | `SITE_BASE_URL` | `https://www.cashheatingoil.com` | No |
-| `NTFY_BASE_URL` | `https://ntfy.sh` | No (unless self-hosting ntfy) |
-| `NTFY_ALERT_TOPIC` | `heating-oil-alerts-placeholder` | **Yes** — set as a secret, not a var (see below) |
 | `STALE_AFTER_DAYS` | `"3"` | No |
 | `USER_AGENT` | `heating-oil-tracker/1.0 (+personal price tracker)` | No |
-| `DB` (`database_id` in `wrangler.jsonc`) | `00000000-0000-0000-0000-000000000000` (placeholder) | **Yes** — real id from `wrangler d1 create` |
+| `NOTIFY_PROVIDER` | `"telegram"` | No — the only transport implemented; kept so a second provider could be added later |
+| `DB` (`database_id` in `wrangler.jsonc`) | the live instance's real database id (set once, per Deploying below) | No, unless you point this project at a different D1 database |
 | `SCRAPE_QUEUE` | binds to queue `heating-oil-scrape` | No, as long as the queue is created with that name |
+
+Two more values are read from `Env` but are deliberately **not** in `wrangler.jsonc`'s `vars` —
+they are Cloudflare **secrets**, set with `wrangler secret put`:
+
+| Secret | Purpose |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | The bot's API token. Grants full control of the bot. |
+| `ALERT_DESTINATION` | The Telegram chat id that receives operational alerts (parse failures, fetch failures, etc.). |
 
 ## Security notes
 
-On **unauthenticated** ntfy — the mode this project uses — the topic name *is* the credential:
-anyone who knows a topic can read every message published to it and publish to it themselves.
-Two consequences follow directly:
-
-- `NTFY_ALERT_TOPIC` is never the real topic in any committed file. The value in `wrangler.jsonc`
-  (`heating-oil-alerts-placeholder`) is a non-sensitive placeholder. The real value is supplied in
-  production as a **secret** — `wrangler secret put NTFY_ALERT_TOPIC` — which overrides the `vars`
-  entry of the same name, and locally (if you want real local alerts) via `.dev.vars`, which is
-  gitignored. Copy `.dev.vars.example` to `.dev.vars` to use it.
-- **Subscriber topics are never in any config file at all.** They live only in
-  `subscriptions.ntfy_topic` in D1. The committed dev seed (`seeds/dev-seed.sql`) uses the
-  placeholder topic `heating-oil-local-dev`; the real subscriber topic is inserted directly into
-  the deployed database and nowhere else.
+- **`TELEGRAM_BOT_TOKEN` and `ALERT_DESTINATION` are secrets, never `vars`, and this matters
+  mechanically, not just as a style preference.** A `vars` entry and a secret of the same name
+  share the same binding namespace, and the `vars` entry **overwrites the secret on every
+  deploy**. This actually happened during this project's development — a stray `vars` entry
+  clobbered the secret, and `wrangler secret list` returned `[]` afterwards. Never add either name
+  to `wrangler.jsonc`'s `vars`.
+- **The bot token must never be logged.** It appears directly in the Telegram API request URL
+  (`.../bot<TOKEN>/sendMessage`), so `src/notify.ts` deliberately logs only the response status
+  and a short body excerpt on failure — never the request URL.
+- **Subscriber destinations are never in any config file at all.** They live only in
+  `subscriptions.destination` in D1 (renamed from `ntfy_topic` by
+  `migrations/0002_notification_destination.sql`). The committed dev seed
+  (`seeds/dev-seed.sql`) uses a placeholder chat id; real subscriber chat ids are inserted
+  directly into the deployed database and nowhere else.
+- Locally, `.dev.vars` (gitignored) can carry real values for `wrangler dev` if you want to test
+  actual delivery; copy `.dev.vars.example` to `.dev.vars` to use it.
 
 ## Deploying (Phase 9)
 
 The steps below are the deploy procedure — **they are performed by Phase 9, not by this
 document**, and were already executed once for this project's live instance. The record of that
-run is in `docs/deployment-log.md`, which is gitignored (it names the real alert topic).
+run is in `docs/deployment-log.md`, which is gitignored (it names the real alert chat id).
 
 ```
 wrangler login
 wrangler d1 create heating-oil
 wrangler d1 migrations apply heating-oil --remote
 wrangler queues create heating-oil-scrape
-wrangler secret put NTFY_ALERT_TOPIC
+wrangler secret put TELEGRAM_BOT_TOKEN
+wrangler secret put ALERT_DESTINATION
 wrangler deploy
 ```
 
-After `wrangler d1 create`, paste the real `database_id` it prints into the single placeholder
-value in `wrangler.jsonc`'s `d1_databases[0].database_id` — this is the one sanctioned
-cross-phase edit to that file. `wrangler secret put NTFY_ALERT_TOPIC` should be given a
-high-entropy value (32+ characters from `[A-Za-z0-9_-]`); it is never written to `wrangler.jsonc`
-or to any commit.
+After `wrangler d1 create`, paste the real `database_id` it prints into `wrangler.jsonc`'s
+`d1_databases[0].database_id` — this is the one sanctioned cross-phase edit to that file (already
+done for this project's live instance). `wrangler secret put TELEGRAM_BOT_TOKEN` takes the bot
+token from @BotFather; `wrangler secret put ALERT_DESTINATION` takes the Telegram chat id that
+should receive operational alerts (see [Getting set up with
+Telegram](#getting-set-up-with-telegram)). Neither is ever written to `wrangler.jsonc` or to any
+commit.
 
 ## Known limits (Cloudflare Workers free tier)
 
@@ -220,24 +267,33 @@ or to any commit.
 
 These are the binding constraints behind this project's design choices — one zip per Queues
 message, multi-row INSERTs capped at 8 rows (88 of 100 bound parameters), and a
-concurrency-limited notification fan-out. See `docs/heating-oil-tracker-prd.md` §9 and
-`docs/cpu-measurement.md` for how the CPU figure specifically is measured and judged.
+concurrency-limited notification fan-out. CPU time was the one figure that had never been measured
+against production traffic; the original parser read price cells with HTMLRewriter text handlers
+and measured **12–16 ms** in production — over the free-tier ceiling, though runs still completed
+`outcome: ok`. The parser was optimised to read price cells with a plain string scan of the
+response body instead of per-cell HTMLRewriter text handlers (HTMLRewriter's native tokenizer is
+essentially free; the cost was the JS callback dispatched per text node). The production queue
+consumer now measures **~10 ms**. See `docs/heating-oil-tracker-prd.md` §9 and
+`docs/cpu-measurement.md` for the full measurement method, the profiling breakdown, and the
+guidance to follow if CPU pressure returns.
 
 ## Troubleshooting
 
 These map to the failure modes in `docs/heating-oil-tracker-prd.md` §8. Everything below shows up
-as a push to whatever topic `NTFY_ALERT_TOPIC` resolves to (the secret in production; the
-placeholder, or your `.dev.vars` override, locally) and as a `console.error` line in Workers Logs
-/ the `wrangler dev` terminal.
+as a message to whatever chat `ALERT_DESTINATION` resolves to (the secret in production; your
+`.dev.vars` override, if set, locally) and as a `console.error` line in Workers Logs / the
+`wrangler dev` terminal.
 
-| Symptom | What it looks like on the alert topic | Likely cause |
+| Symptom | What it looks like on the alert chat | Likely cause |
 |---|---|---|
 | **Zero listings parsed** | `no listings for <zip>` — "the page parsed cleanly but contained zero listings. No rows written, no subscribers notified." | The results page loaded and is structurally valid HTML, but `div.boxlisting` count is zero for that zip today — e.g. no dealers currently list that zip. Not a crash; the day is simply skipped for that zip (PRD §8: a missing day beats a wrong one). |
 | **`ParseError` from markup drift** | `zip <zip> failed` with a `ParseError: ...` message naming the listing index | The site's HTML structure changed in a way the state machine doesn't recognize (a missing `dealerid`, a duplicate tier, forms that no longer pair up as one cash + one credit, etc.). The message is acked, not retried — a parse error can't be fixed by trying again — so re-check the fixture and parser against the live markup. |
 | **Fetch failure** | `zip <zip> failed` with a `FetchError: ...` message, `attempts` incrementing across retries | The POST/redirect resolution or the cached-slug GET failed (non-2xx, timeout, oversized body, or an SSRF-guard rejection). The zip's cached slug is cleared so tomorrow re-resolves from scratch, and the message is retried up to `max_retries: 3` before being dropped. |
-| **Stale data** | Not an alert by itself — the ntfy notification body itself carries a stale banner | `price_updated_on` across a zip's listings has not advanced in more than `STALE_AFTER_DAYS` (default 3) relative to `scrape_date`. The subscriber is still notified (a stale price may be genuinely flat), just told it's stale. |
+| **Stale data** | Not an alert by itself — the Telegram notification body itself carries a stale banner | `price_updated_on` across a zip's listings has not advanced in more than `STALE_AFTER_DAYS` (default 3) relative to `scrape_date`. The subscriber is still notified (a stale price may be genuinely flat), just told it's stale. |
 | **No active zips** | `no active zips` — "scrape_date=...: no active zips — nothing will be scraped." | The committed seed leaves every zip inactive; this fires every cron run until one is activated. Not a bug — it's the safety default (see the opt-in warning above). |
 | **Cron producer failed** | `cron producer failed` with the underlying error | `getActiveZips` or `SCRAPE_QUEUE.sendBatch` threw. The cron invocation itself is rethrown after alerting, so it shows as a failed invocation in the dashboard too — this is the one path that is *not* swallowed. |
+| **Telegram `401 Unauthorized`** | `[telegram] send rejected: status=401 ...` in Workers Logs | The bot token is wrong, revoked, or was pasted with leading/trailing whitespace or a newline (`wrangler secret put` reads stdin literally). Re-copy the token from @BotFather and re-run `wrangler secret put TELEGRAM_BOT_TOKEN`. |
+| **Telegram `400 Bad Request`** | `[telegram] send rejected: status=400 ...` in Workers Logs | Usually a bad `chat_id` — malformed, or a chat the bot cannot message. A chat id is only obtainable after that user has messaged the bot at least once (see [Getting set up with Telegram](#getting-set-up-with-telegram)); if they haven't, Telegram has nothing to deliver to. |
 
 ## Accepted risks
 
@@ -245,14 +301,14 @@ Carried over from `docs/implementation-plan.md` §7 — these are deliberate, do
 not bugs:
 
 - **Notification delivery is at-least-once.** Cloudflare Queues redelivers on retry, and the
-  dedupe record in the `notifications` table is written only *after* a successful ntfy push (it
-  has to be — recording first would permanently suppress a notification if the push then failed).
-  A crash or D1 failure in the narrow window between a successful push and that write can cause a
-  rare duplicate notification. Ordinary retries, aggregate-failure retries, and manual re-runs are
-  all still deduplicated; only that narrow crash window is not.
+  dedupe record in the `notifications` table is written only *after* a successful Telegram push
+  (it has to be — recording first would permanently suppress a notification if the push then
+  failed). A crash or D1 failure in the narrow window between a successful push and that write can
+  cause a rare duplicate notification. Ordinary retries, aggregate-failure retries, and manual
+  re-runs are all still deduplicated; only that narrow crash window is not.
 - **There is no dead-letter queue.** `wrangler.jsonc` sets `max_retries: 3` with no
   `dead_letter_queue`. After three failed attempts a message is dropped and that zip has no data
-  for the day. The compensating control is the ntfy alert pushed on every failed attempt, plus
+  for the day. The compensating control is the Telegram alert pushed on every failed attempt, plus
   Cloudflare Workers Logs as the durable backstop, and tomorrow's cron retries from scratch. This
   is accepted as proportionate for a single-user personal tracker (see implementation plan
   assumptions A12 and A15).

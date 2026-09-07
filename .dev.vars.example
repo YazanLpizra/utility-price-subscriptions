@@ -2,20 +2,32 @@
 #
 # `.dev.vars` is gitignored and must stay that way.
 #
-# In v1 there is exactly one override that matters: NTFY_ALERT_TOPIC.
+# Two values matter, and both are SECRETS in production — never `vars` in
+# wrangler.jsonc. A var of the same name shares the binding namespace with
+# secrets and OVERWRITES the secret on every deploy; that happened once here,
+# and `wrangler secret list` came back empty afterwards.
 #
-# On unauthenticated ntfy.sh the topic name IS the credential — anyone who knows
-# the topic can read and publish to it. That is why the value committed in
-# wrangler.jsonc ("heating-oil-alerts-placeholder") is deliberately NOT the real
-# topic, and why the real one is never written into any tracked file.
+#   - production: `wrangler secret put TELEGRAM_BOT_TOKEN`
+#                 `wrangler secret put ALERT_DESTINATION`
+#   - locally:    set them below only if you want real local delivery.
 #
-#   - production: `wrangler secret put NTFY_ALERT_TOPIC` (a secret of the same
-#     name overrides the `vars` entry). Done in Phase 9.
-#   - locally:    set it here if you want real local alerts. Otherwise the
-#     placeholder stands, which is harmless — every local test injects a stub
-#     `fetchImpl` and issues no network request.
+# Leaving them unset is the safe default: `postToTelegram` refuses to send
+# without a bot token, and every test injects a stub `fetchImpl` and issues no
+# network request. Combined with the dev seed marking every zip inactive, a
+# local run reaches neither cashheatingoil.com nor Telegram.
 #
-# Subscriber topics are never in config at all: they live only in D1, in
-# subscriptions.ntfy_topic.
+# A bot token grants full control of the bot, so it never goes in a tracked
+# file. It also appears in the request URL, which is why the code logs response
+# status and body excerpts but never the URL.
+#
+# Subscriber destinations are not config at all: they live only in D1, in
+# subscriptions.destination, and hold a Telegram chat id.
 
-NTFY_ALERT_TOPIC = "replace-with-your-private-alert-topic"
+# From @BotFather.
+TELEGRAM_BOT_TOKEN = "123456789:replace-with-your-bot-token"
+
+# Chat id that receives operational alerts (parse failures, fetch failures).
+# Message your bot once, then read it from:
+#   https://api.telegram.org/bot<TOKEN>/getUpdates
+# Telegram will not reveal a chat id until the user contacts the bot first.
+ALERT_DESTINATION = "replace-with-your-chat-id"
