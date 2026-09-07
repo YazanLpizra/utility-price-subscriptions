@@ -5,7 +5,7 @@
  * (`processZip`) or replaces `globalThis.fetch` with a recording stub for the
  * duration of the test (`scheduled` / `queue`, whose signatures are fixed by
  * §2.2 and take no fetch parameter). No test can reach cashheatingoil.com or
- * ntfy.sh: the stub throws on any URL it does not recognise.
+ * Telegram: the stub throws on any URL it does not recognise.
  *
  * Storage is reset before every `it()` by the global hook in test/setup.ts.
  */
@@ -30,12 +30,16 @@ import type { Env, ScrapeMessage } from "../src/types";
 // ---------------------------------------------------------------------------
 
 const BASE = "https://www.cashheatingoil.com";
-const NTFY = "https://ntfy.sh";
-// Read from the binding rather than hardcoded: NTFY_ALERT_TOPIC is not a var
+// Telegram sends every message to ONE url and distinguishes recipients by the
+// chat_id in the JSON body, so the helpers below route on body, not on url.
+const TG_API = "https://api.telegram.org";
+const TG_TOKEN = "123:TESTTOKEN";
+const TG_SEND_URL = `${TG_API}/bot${TG_TOKEN}/sendMessage`;
+// Read from the binding rather than hardcoded: ALERT_DESTINATION is not a var
 // in wrangler.jsonc (a var there would overwrite the production secret on
 // every deploy), so it is supplied as a test-only binding in vitest.config.ts.
-const ALERT_TOPIC = testEnv.NTFY_ALERT_TOPIC;
-const SUB_TOPIC = "heating-oil-local-dev";
+const ALERT_TOPIC = testEnv.ALERT_DESTINATION;
+const SUB_TOPIC = "5551234567";
 const ZIP = "06483";
 const SLUG = "seymour_ct_oil_prices/06483";
 const SLUG_URL = `${BASE}/${SLUG}`;
@@ -80,8 +84,8 @@ interface RouteOptions {
   postStatus?: number;
   /** Status for the slug GET. Default 200. */
   slugStatus?: number;
-  /** Status for every ntfy POST. Default 200. */
-  ntfyStatus?: number;
+  /** Status for every Telegram sendMessage. Default 200. */
+  notifyStatus?: number;
   /** Slug the POST redirects to, per requested zip. */
   slugFor?: (zip: string) => string;
 }
@@ -96,15 +100,17 @@ function makeStub(opts: RouteOptions = {}) {
   const html = opts.html ?? fixture;
   const postStatus = opts.postStatus ?? 302;
   const slugStatus = opts.slugStatus ?? 200;
-  const ntfyStatus = opts.ntfyStatus ?? 200;
+  const notifyStatus = opts.notifyStatus ?? 200;
   const slugFor = opts.slugFor ?? (() => SLUG);
 
   const impl = (async (input: unknown, init?: RequestInit) => {
     const url = String(input);
     calls.push({ url, init });
 
-    if (url.startsWith(`${NTFY}/`)) {
-      return new Response(null, { status: ntfyStatus });
+    if (url === TG_SEND_URL) {
+      return new Response(notifyStatus === 200 ? '{"ok":true}' : '{"ok":false}', {
+        status: notifyStatus,
+      });
     }
     if (url === POST_URL) {
       if (postStatus !== 302) return new Response(null, { status: postStatus });
@@ -122,9 +128,24 @@ function makeStub(opts: RouteOptions = {}) {
   }) as unknown as typeof fetch;
 
   const siteCalls = () => calls.filter((c) => c.url.startsWith(`${BASE}/`));
-  const alertCalls = () => calls.filter((c) => c.url === `${NTFY}/${ALERT_TOPIC}`);
-  const subCalls = () => calls.filter((c) => c.url === `${NTFY}/${SUB_TOPIC}`);
-  const bodyOf = (c: Recorded) => (typeof c.init?.body === "string" ? c.init.body : "");
+  const chatIdOf = (c: Recorded): string => {
+    try {
+      return JSON.parse(String(c.init?.body ?? "{}")).chat_id ?? "";
+    } catch {
+      return "";
+    }
+  };
+  const sendCalls = () => calls.filter((c) => c.url === TG_SEND_URL);
+  const alertCalls = () => sendCalls().filter((c) => chatIdOf(c) === ALERT_TOPIC);
+  const subCalls = () => sendCalls().filter((c) => chatIdOf(c) === SUB_TOPIC);
+  /** The message text, which is what assertions about content care about. */
+  const bodyOf = (c: Recorded) => {
+    try {
+      return String(JSON.parse(String(c.init?.body ?? "{}")).text ?? "");
+    } catch {
+      return "";
+    }
+  };
 
   return { impl, calls, siteCalls, alertCalls, subCalls, bodyOf };
 }
@@ -145,11 +166,11 @@ async function seed(slug: string | null = null): Promise<void> {
       "INSERT INTO zips (zip, slug, city, state, active, slug_resolved_at) VALUES (?,?,?,?,1,?)",
     ).bind(ZIP, slug, slug === null ? null : "seymour", slug === null ? null : "ct", slug === null ? null : "2026-09-01T00:00:00.000Z"),
     baseEnv.DB.prepare(
-      "INSERT INTO subscriptions (id, user_id, zip, ntfy_topic, min_gallons, payment_type, threshold, active) " +
+      "INSERT INTO subscriptions (id, user_id, zip, destination, min_gallons, payment_type, threshold, active) " +
         "VALUES (1,'v1',?,?,100,'cash',NULL,1)",
     ).bind(ZIP, SUB_TOPIC),
     baseEnv.DB.prepare(
-      "INSERT INTO subscriptions (id, user_id, zip, ntfy_topic, min_gallons, payment_type, threshold, active) " +
+      "INSERT INTO subscriptions (id, user_id, zip, destination, min_gallons, payment_type, threshold, active) " +
         "VALUES (2,'v1',?,?,50,'cash',NULL,1)",
     ).bind(ZIP, SUB_TOPIC),
   ]);
@@ -360,9 +381,9 @@ describe("processZip — end to end against the real fixture", () => {
     await baseEnv.DB.batch(
       Array.from({ length: 8 }, (_, i) =>
         // `user_id` varies: subscriptions carry a UNIQUE
-        // (user_id, zip, ntfy_topic, payment_type, min_gallons).
+        // (user_id, zip, destination, payment_type, min_gallons).
         baseEnv.DB.prepare(
-          "INSERT INTO subscriptions (id, user_id, zip, ntfy_topic, min_gallons, payment_type, threshold, active) " +
+          "INSERT INTO subscriptions (id, user_id, zip, destination, min_gallons, payment_type, threshold, active) " +
             "VALUES (?,?,?,?,100,'cash',NULL,1)",
         ).bind(10 + i, `v${10 + i}`, ZIP, SUB_TOPIC),
       ),
@@ -605,10 +626,10 @@ describe("processZip — FetchError", () => {
   });
 });
 
-describe("processZip — ntfy failure", () => {
+describe("processZip — notification failure", () => {
   it("keeps the rows, resolves, counts zero notifications, and records no dedupe row", async () => {
     await seed(null);
-    const stub = makeStub({ ntfyStatus: 500 });
+    const stub = makeStub({ notifyStatus: 500 });
 
     const result = await processZip(message(), baseEnv, stub.impl);
 
@@ -804,7 +825,7 @@ describe("queue — the consumer", () => {
     const impl = (async (input: unknown, init?: RequestInit) => {
       const url = String(input);
       calls.push({ url, init });
-      if (url.startsWith(`${NTFY}/`)) return new Response(null, { status: 200 });
+      if (url === TG_SEND_URL) return new Response('{"ok":true}', { status: 200 });
       if (url === POST_URL) {
         const zip = zipFromPostBody(init);
         if (zip === "06611") {
@@ -836,7 +857,7 @@ describe("queue — the consumer", () => {
     ).first<{ c: number }>();
     expect(row?.c).toBe(39);
 
-    expect(calls.filter((c) => c.url === `${NTFY}/${ALERT_TOPIC}`)).toHaveLength(1);
+    expect(calls.filter((c) => c.url === TG_SEND_URL)).toHaveLength(1);
   });
 
   it("acks and alerts a malformed message without ever entering processZip", async () => {
@@ -945,9 +966,9 @@ describe("queue — bodies that break JSON.stringify are still acked, never retr
 describe("queue — an alert that could not be delivered", () => {
   it("still ACKS the branch and logs ALERT_DELIVERY_FAILED", async () => {
     await seed(null);
-    // The site serves a listing-free page (so queue() alerts) and ntfy 500s
+    // The site serves a listing-free page (so queue() alerts) and Telegram 500s
     // (so the alert itself fails). Nothing throws; the log is the whole record.
-    const stub = makeStub({ html: strippedFixture, ntfyStatus: 500 });
+    const stub = makeStub({ html: strippedFixture, notifyStatus: 500 });
     vi.stubGlobal("fetch", stub.impl);
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -981,7 +1002,7 @@ describe("queue — driven through the real cloudflare:test message batch", () =
     // 06611 resolves and serves the fixture; 06483 500s on both fetch paths.
     const impl = (async (input: unknown, init?: RequestInit) => {
       const url = String(input);
-      if (url.startsWith(`${NTFY}/`)) return new Response(null, { status: 200 });
+      if (url === TG_SEND_URL) return new Response('{"ok":true}', { status: 200 });
       if (url === POST_URL) {
         return zipFromPostBody(init) === "06611"
           ? new Response(null, {

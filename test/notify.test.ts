@@ -1,5 +1,5 @@
 /**
- * Phase 5 — evaluation, staleness and ntfy tests.
+ * Phase 5 — evaluation, staleness and notification-transport tests.
  *
  * Listings are built BY HAND from implementation-plan §1.3; this phase must not
  * depend on Phase 2's parser. No test touches the network: every transport test
@@ -19,7 +19,7 @@ import {
   notificationFingerprint,
   selectBestPrice,
   sendAlert,
-  sendNtfy,
+  sendNotification,
 } from "../src/notify";
 import type {
   Env,
@@ -131,7 +131,7 @@ function sub(over: Partial<Subscription> = {}): Subscription {
     id: 1,
     user_id: "v1",
     zip: "06483",
-    ntfy_topic: "heating-oil-local-dev",
+    destination: "heating-oil-local-dev",
     min_gallons: 100,
     payment_type: "cash",
     threshold: null,
@@ -144,9 +144,11 @@ const env: Env = {
   DB: null as never,
   SCRAPE_QUEUE: null as never,
   SITE_BASE_URL: "https://www.cashheatingoil.com",
-  NTFY_BASE_URL: "https://ntfy.sh",
-  NTFY_ALERT_TOPIC: "alerts-topic",
+  ALERT_DESTINATION: "5838650961",
   STALE_AFTER_DAYS: "3",
+  NOTIFY_PROVIDER: "telegram",
+  TELEGRAM_BOT_TOKEN: "123:ABC",
+  TELEGRAM_API_BASE: "https://api.telegram.org",
   USER_AGENT: "heating-oil-tracker/1.0 (test)",
 };
 
@@ -445,92 +447,16 @@ describe("notificationFingerprint", () => {
   });
 });
 
-// --------------------------------------------------------------- transport
-
-describe("sendNtfy", () => {
-  const msg = { title: "t", body: "b", tags: ["fuelpump"], priority: 3 };
-
-  it("POSTs to the topic URL with the ntfy headers", async () => {
-    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
-    expect(await sendNtfy(env, "my-topic", msg, impl)).toBe(true);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.url).toBe("https://ntfy.sh/my-topic");
-    expect(calls[0]!.init?.method).toBe("POST");
-    const headers = calls[0]!.init?.headers as Record<string, string>;
-    expect(headers["Title"]).toBe("t");
-    expect(headers["Priority"]).toBe("3");
-    expect(headers["Tags"]).toBe("fuelpump");
-    expect(calls[0]!.init?.body).toBe("b");
-  });
-
-  it("returns false on a 500 without throwing", async () => {
-    const { impl } = stubFetch(() => new Response("no", { status: 500 }));
-    expect(await sendNtfy(env, "my-topic", msg, impl)).toBe(false);
-  });
-
-  it("returns false when the transport rejects outright", async () => {
-    const impl = (async () => {
-      throw new Error("network down");
-    }) as unknown as typeof fetch;
-    await expect(sendNtfy(env, "my-topic", msg, impl)).resolves.toBe(false);
-  });
-
-  it("passes an abort signal so a stalled connection cannot hold the invocation", async () => {
-    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
-    await sendNtfy(env, "my-topic", msg, impl);
-    const signal = (calls[0]!.init as RequestInit).signal;
-    expect(signal).toBeInstanceOf(AbortSignal);
-    expect(signal!.aborted).toBe(false);
-  });
-
-  it("returns false — never throws — when the request is ABORTED by the timeout", async () => {
-    // A queue invocation has a 15-minute ceiling; without a timeout a stalled
-    // ntfy connection burns it. The abort must surface as a `false`, exactly
-    // like any other transport failure, so no data that is already in D1 is
-    // treated as lost.
-    const impl = (async () => {
-      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
-    }) as unknown as typeof fetch;
-    await expect(sendNtfy(env, "my-topic", msg, impl)).resolves.toBe(false);
-  });
-
-  it("sendAlert also returns false on an AbortError rather than throwing", async () => {
-    const impl = (async () => {
-      const err = new Error("aborted");
-      err.name = "AbortError";
-      throw err;
-    }) as unknown as typeof fetch;
-    await expect(sendAlert(env, "t", "b", impl)).resolves.toBe(false);
-  });
-
-  describe("rejects a malformed topic without issuing a request", () => {
-    const bad = ["", "../admin", "a/b", "topic with spaces", "a".repeat(65), "t;rm -rf"];
-    for (const topic of bad) {
-      it(JSON.stringify(topic), async () => {
-        const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
-        expect(await sendNtfy(env, topic, msg, impl)).toBe(false);
-        expect(calls).toHaveLength(0);
-      });
-    }
-  });
-
-  it("accepts the allowed topic alphabet", async () => {
-    const { impl } = stubFetch(() => new Response("ok", { status: 200 }));
-    expect(await sendNtfy(env, "yazan-06483-oil", msg, impl)).toBe(true);
-    expect(await sendNtfy(env, "A_b-9", msg, impl)).toBe(true);
-  });
-});
 
 describe("sendAlert", () => {
-  it("posts to NTFY_ALERT_TOPIC at priority 4 with a warning tag", async () => {
+  it("posts alerts to ALERT_DESTINATION", async () => {
     const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
     expect(await sendAlert(env, "parse failed", "details here", impl)).toBe(true);
-    expect(calls[0]!.url).toBe("https://ntfy.sh/alerts-topic");
-    const headers = calls[0]!.init?.headers as Record<string, string>;
-    expect(headers["Priority"]).toBe("4");
-    expect(headers["Tags"]).toContain("warning");
-    expect(headers["Title"]).toContain("parse failed");
-    expect(calls[0]!.init?.body).toBe("details here");
+    expect(calls[0]!.url).toContain("/sendMessage");
+    const body = JSON.parse(String(calls[0]!.init?.body));
+    expect(body.chat_id).toBe("5838650961");
+    expect(body.text).toContain("parse failed");
+    expect(body.text).toContain("details here");
   });
 
   it("never throws when the transport rejects", async () => {
@@ -540,69 +466,100 @@ describe("sendAlert", () => {
     await expect(sendAlert(env, "t", "b", impl)).resolves.toBe(false);
   });
 
-  it("returns false rather than throwing when the alert topic is malformed", async () => {
+  it("returns false rather than throwing when the alert destination is malformed", async () => {
     const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
-    const broken: Env = { ...env, NTFY_ALERT_TOPIC: "not a topic" };
+    const broken: Env = { ...env, ALERT_DESTINATION: "not a chat id" };
     expect(await sendAlert(broken, "t", "b", impl)).toBe(false);
     expect(calls).toHaveLength(0);
   });
 });
 
-// --------------------------------------------------------------- ntfy auth
 
-describe("ntfy authentication", () => {
-  const msg = { title: "t", body: "b", tags: ["fuelpump"], priority: 3 };
+// --------------------------------------------------------------- telegram
 
-  it("sends no Authorization header when no token is configured", async () => {
-    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
-    expect(await sendNtfy(env, "my-topic", msg, impl)).toBe(true);
-    const headers = calls[0]!.init?.headers as Record<string, string>;
-    expect(headers["Authorization"]).toBeUndefined();
+describe("telegram transport", () => {
+  const msg = { title: "T", body: "B", tags: ["fuelpump"], priority: 3 };
+  const tg: Env = {
+    ...env,
+    NOTIFY_PROVIDER: "telegram",
+    TELEGRAM_BOT_TOKEN: "123:ABC",
+    TELEGRAM_API_BASE: "https://api.telegram.org",
+  };
+
+  it("posts sendMessage with the chat id and a combined title/body", async () => {
+    const { impl, calls } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
+    expect(await sendNotification(tg, "5838650961", msg, impl)).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("https://api.telegram.org/bot123:ABC/sendMessage");
+    const body = JSON.parse(String(calls[0]!.init?.body));
+    expect(body.chat_id).toBe("5838650961");
+    expect(body.text).toContain("T");
+    expect(body.text).toContain("B");
   });
 
-  it("sends a Bearer token when NTFY_TOKEN is set", async () => {
-    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
-    const authed: Env = { ...env, NTFY_TOKEN: "tk_example" };
-    expect(await sendNtfy(authed, "my-topic", msg, impl)).toBe(true);
-    const headers = calls[0]!.init?.headers as Record<string, string>;
-    expect(headers["Authorization"]).toBe("Bearer tk_example");
+  it("sends no parse_mode, so $ and . in prices cannot break formatting", async () => {
+    const { impl, calls } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
+    await sendNotification(tg, "5838650961", { ...msg, body: "$4.81 per gallon (cash)" }, impl);
+    const body = JSON.parse(String(calls[0]!.init?.body));
+    expect(body.parse_mode).toBeUndefined();
+    expect(body.text).toContain("$4.81");
   });
 
-  it("authenticates alerts too, not just subscriber pushes", async () => {
-    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
-    const authed: Env = { ...env, NTFY_TOKEN: "tk_example" };
-    expect(await sendAlert(authed, "t", "b", impl)).toBe(true);
-    const headers = calls[0]!.init?.headers as Record<string, string>;
-    expect(headers["Authorization"]).toBe("Bearer tk_example");
+  it("accepts a negative chat id (groups and channels)", async () => {
+    const { impl, calls } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
+    expect(await sendNotification(tg, "-1001234567890", msg, impl)).toBe(true);
+    expect(calls).toHaveLength(1);
   });
 
-  it("never puts the token in the URL, where it could be logged", async () => {
-    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
-    const authed: Env = { ...env, NTFY_TOKEN: "tk_example" };
-    await sendNtfy(authed, "my-topic", msg, impl);
-    expect(calls[0]!.url).toBe("https://ntfy.sh/my-topic");
-    expect(calls[0]!.url).not.toContain("tk_example");
+  describe("refuses a malformed chat id without issuing a request", () => {
+    for (const bad of ["", "abc", "58386 50961", "12;34", "../admin", "1e5"]) {
+      it(JSON.stringify(bad), async () => {
+        const { impl, calls } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
+        expect(await sendNotification(tg, bad, msg, impl)).toBe(false);
+        expect(calls).toHaveLength(0);
+      });
+    }
   });
 
-  it("still returns false, without throwing, when an authenticated push is rejected", async () => {
-    const { impl } = stubFetch(() => new Response("denied", { status: 401 }));
-    const authed: Env = { ...env, NTFY_TOKEN: "tk_example" };
-    expect(await sendNtfy(authed, "my-topic", msg, impl)).toBe(false);
+  it("returns false, without sending, when no bot token is configured", async () => {
+    const { impl, calls } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
+    const noToken: Env = { ...tg, TELEGRAM_BOT_TOKEN: undefined };
+    expect(await sendNotification(noToken, "5838650961", msg, impl)).toBe(false);
+    expect(calls).toHaveLength(0);
   });
 
-  it("trims a token stored with a trailing newline by `wrangler secret put`", async () => {
-    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
-    const authed: Env = { ...env, NTFY_TOKEN: "tk_example\r\n" };
-    expect(await sendNtfy(authed, "my-topic", msg, impl)).toBe(true);
-    const headers = calls[0]!.init?.headers as Record<string, string>;
-    expect(headers["Authorization"]).toBe("Bearer tk_example");
+  it("trims a bot token stored with a trailing newline", async () => {
+    const { impl, calls } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
+    const padded: Env = { ...tg, TELEGRAM_BOT_TOKEN: "123:ABC\r\n" };
+    expect(await sendNotification(padded, "5838650961", msg, impl)).toBe(true);
+    expect(calls[0]!.url).toBe("https://api.telegram.org/bot123:ABC/sendMessage");
   });
 
-  it("treats a whitespace-only token as absent", async () => {
-    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
-    const authed: Env = { ...env, NTFY_TOKEN: "   " };
-    expect(await sendNtfy(authed, "my-topic", msg, impl)).toBe(true);
-    const headers = calls[0]!.init?.headers as Record<string, string>;
-    expect(headers["Authorization"]).toBeUndefined();
+  it("returns false on a 400 and never throws", async () => {
+    const { impl } = stubFetch(() => new Response('{"ok":false}', { status: 400 }));
+    await expect(sendNotification(tg, "5838650961", msg, impl)).resolves.toBe(false);
+  });
+
+  it("returns false when the transport rejects outright", async () => {
+    const impl = (async () => {
+      throw new Error("network down");
+    }) as unknown as typeof fetch;
+    await expect(sendNotification(tg, "5838650961", msg, impl)).resolves.toBe(false);
+  });
+
+  it("routes alerts through Telegram too, not just subscriber pushes", async () => {
+    const { impl, calls } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
+    const alerting: Env = { ...tg, ALERT_DESTINATION: "5838650961" };
+    expect(await sendAlert(alerting, "parse failed", "details", impl)).toBe(true);
+    expect(calls[0]!.url).toContain("/sendMessage");
+    const body = JSON.parse(String(calls[0]!.init?.body));
+    expect(body.text).toContain("parse failed");
+  });
+
+  it("routes through Telegram even when NOTIFY_PROVIDER is unset", async () => {
+    const { impl, calls } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
+    const noProvider: Env = { ...tg, NOTIFY_PROVIDER: undefined };
+    expect(await sendNotification(noProvider, "5838650961", msg, impl)).toBe(true);
+    expect(calls[0]!.url).toContain("/sendMessage");
   });
 });

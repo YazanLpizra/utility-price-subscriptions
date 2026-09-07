@@ -123,12 +123,12 @@ describe("seeds/dev-seed.sql", () => {
     expect(row!.c).toBe(0);
   });
 
-  it("uses only the placeholder ntfy topic, never a real one", async () => {
+  it("uses only the placeholder destination, never a real one", async () => {
     await applySeed();
     const rows = await DB.prepare(
-      "SELECT DISTINCT ntfy_topic FROM subscriptions",
-    ).all<{ ntfy_topic: string }>();
-    expect(rows.results.map((r) => r.ntfy_topic)).toEqual(["heating-oil-local-dev"]);
+      "SELECT DISTINCT destination FROM subscriptions",
+    ).all<{ destination: string }>();
+    expect(rows.results.map((r) => r.destination)).toEqual(["5551234567"]);
   });
 
   it("is idempotent: applying it twice changes no counts", async () => {

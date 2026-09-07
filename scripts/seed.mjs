@@ -16,7 +16,7 @@
  *   node scripts/seed.mjs --add-zip 06611
  *   node scripts/seed.mjs --activate 06611
  *   node scripts/seed.mjs --deactivate 06611
- *   node scripts/seed.mjs --add-sub <zip> <topic> <min_gallons> <cash|credit> [threshold]
+ *   node scripts/seed.mjs --add-sub <zip> <chat-id> <min_gallons> <cash|credit> [threshold]
  *   node scripts/seed.mjs --help
  */
 
@@ -32,7 +32,8 @@ const SEED_FILE = join(ROOT, "seeds", "dev-seed.sql");
 // --------------------------------------------------------------- validation
 
 const ZIP_RE = /^\d{5}$/;
-const TOPIC_RE = /^[A-Za-z0-9_-]{1,64}$/;
+/** A Telegram chat id: digits, optionally negative for groups and channels. */
+const DESTINATION_RE = /^-?\d{1,20}$/;
 const THRESHOLD_RE = /^\d+(\.\d{1,2})?$/;
 const PAYMENT_TYPES = new Set(["cash", "credit"]);
 const MAX_GALLONS = 100000;
@@ -46,10 +47,10 @@ function validZip(value) {
   return value;
 }
 
-function validTopic(value) {
-  if (typeof value !== "string" || !TOPIC_RE.test(value)) {
+function validDestination(value) {
+  if (typeof value !== "string" || !DESTINATION_RE.test(value)) {
     throw new UsageError(
-      `invalid ntfy topic ${JSON.stringify(value ?? "")}: expected 1-64 of [A-Za-z0-9_-]`,
+      `invalid destination ${JSON.stringify(value ?? "")}: expected a Telegram chat id (digits, optionally negative)`,
     );
   }
   return value;
@@ -179,10 +180,10 @@ function addSubSql(zip, topic, gallons, payment, threshold) {
   const t = threshold === null ? "NULL" : String(threshold);
   return (
     `INSERT INTO subscriptions ` +
-    `(user_id, zip, ntfy_topic, min_gallons, payment_type, threshold, active) ` +
+    `(user_id, zip, destination, min_gallons, payment_type, threshold, active) ` +
     `VALUES ('v1', ${sqlString(zip)}, ${sqlString(topic)}, ${gallons}, ` +
     `${sqlString(payment)}, ${t}, 1) ` +
-    `ON CONFLICT (user_id, zip, ntfy_topic, payment_type, min_gallons) DO UPDATE SET ` +
+    `ON CONFLICT (user_id, zip, destination, payment_type, min_gallons) DO UPDATE SET ` +
     `threshold = excluded.threshold, active = excluded.active;`
   );
 }
@@ -196,10 +197,10 @@ const HELP = `heating-oil tracker — local seed / admin
   --add-zip <zip>                          add a zip, INACTIVE
   --activate <zip>                         activate a zip (causes real fetches!)
   --deactivate <zip>                       pause a zip, keeping its history
-  --add-sub <zip> <topic> <gallons> <cash|credit> [threshold]
+  --add-sub <zip> <chat-id> <gallons> <cash|credit> [threshold]
 
 Every zip in the dev seed is INACTIVE, so a local run reaches no network.
-Validation grammars: zip 5 digits; topic [A-Za-z0-9_-]{1,64}; gallons an
+Validation grammars: zip 5 digits; destination a Telegram chat id; gallons an
 integer 1..${MAX_GALLONS}; payment cash|credit; threshold positive, <= 2 dp.
 `;
 
@@ -262,7 +263,7 @@ function main(argv) {
         const [zip, topic, gallons, payment, threshold] = opts.args;
         sql = addSubSql(
           validZip(zip),
-          validTopic(topic),
+          validDestination(topic),
           validGallons(gallons),
           validPaymentType(payment),
           validThreshold(threshold),

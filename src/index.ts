@@ -2,7 +2,7 @@
  * Phase 7 — cron producer + queue consumer orchestration.
  *
  * This module wires the four wave-2 modules together and owns nothing else: it
- * contains no HTML knowledge, no SQL, and no ntfy transport of its own. Every
+ * contains no HTML knowledge, no SQL, and no notification transport of its own. Every
  * piece of behaviour below is composition.
  *
  * ---------------------------------------------------------------------------
@@ -12,7 +12,7 @@
  * `ParseError`) and otherwise returns a complete `ProcessZipResult`. The
  * `queue()` handler is the only caller of `sendAlert` on the per-zip path, and
  * `scheduled()` the only caller on the producer path. Two owners would double
- * every alert on an at-least-once redelivery and make the alert topic useless
+ * every alert on an at-least-once redelivery and make the alert channel useless
  * exactly when it matters.
  *
  * ---------------------------------------------------------------------------
@@ -28,7 +28,7 @@
  *                           caveat: no PRICE rows, but the slug may be written.
  *   FetchError           -> clearZipSlug (so tomorrow re-resolves from scratch),
  *                           then rethrow; queue() alerts and RETRIES.
- *   sendNtfy false       -> not a message failure. The D1 write already
+ *   sendNotification false -> not a message failure. The D1 write already
  *                           happened, so the data is not lost.
  *   subscription task
  *   rejected             -> processZip throws an aggregate error AFTER the price
@@ -55,7 +55,7 @@
  * third failed attempt a message is **dropped** and that zip simply has no data
  * for the day. This is an ACCEPTED RISK for a personal daily job, recorded here
  * so nobody later reads the retry count as a durability guarantee: the
- * compensating control is the ntfy alert pushed on every failed attempt, and
+ * compensating control is the alert pushed on every failed attempt, and
  * tomorrow's cron tries again from scratch. Adding a DLQ is a wrangler.jsonc
  * change plus a second consumer, and is out of scope for v1.
  */
@@ -78,7 +78,7 @@ import {
   isStale,
   notificationFingerprint,
   sendAlert,
-  sendNtfy,
+  sendNotification,
 } from "./notify";
 import type { Env, FetchedPage, ScrapeMessage } from "./types";
 
@@ -394,16 +394,16 @@ export async function processZip(
     pending,
     MAX_NOTIFY_CONCURRENCY,
     async ({ sub, decision }): Promise<NotifiedRow | null> => {
-      const sent = await sendNtfy(
+      const sent = await sendNotification(
         env,
-        sub.ntfy_topic,
+        sub.destination,
         buildNotification(decision, zip, scrapeDate),
         fetchImpl,
       );
       // A false return is logged, never thrown: the data is already in D1.
       if (!sent) {
         console.log(
-          `[processZip] ${zip}: ntfy push failed for subscription ${sub.id}; row data is already written`,
+          `[processZip] ${zip}: notification failed for subscription ${sub.id}; row data is already written`,
         );
         return null;
       }
@@ -522,7 +522,7 @@ export default {
     } catch (err) {
       // Alert best effort, then RETHROW. A cron invocation that swallows its own
       // failure is reported as a success in Cloudflare's dashboard, and the
-      // operator's only signal would be an ntfy push that may itself have failed.
+      // operator's only signal would be a push that may itself have failed.
       await alertOrLog(
         env,
         "none",

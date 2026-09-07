@@ -392,7 +392,7 @@ describe("subscriptions", () => {
     minGallons: number,
   ): Promise<void> {
     await DB.prepare(
-      "INSERT INTO subscriptions (id, user_id, zip, ntfy_topic, min_gallons, payment_type, threshold, active) VALUES (?,?,?,?,?,?,?,?)",
+      "INSERT INTO subscriptions (id, user_id, zip, destination, min_gallons, payment_type, threshold, active) VALUES (?,?,?,?,?,?,?,?)",
     )
       .bind(id, "v1", zip, `topic-${id}`, minGallons, "cash", null, active)
       .run();
@@ -423,7 +423,7 @@ describe("notification de-duplication", () => {
   async function seedSub(id: number): Promise<void> {
     await seedZip();
     await DB.prepare(
-      "INSERT INTO subscriptions (id, user_id, zip, ntfy_topic, min_gallons, payment_type, threshold, active) VALUES (?,?,?,?,?,?,?,?)",
+      "INSERT INTO subscriptions (id, user_id, zip, destination, min_gallons, payment_type, threshold, active) VALUES (?,?,?,?,?,?,?,?)",
     )
       .bind(id, "v1", ZIP, "heating-oil-local-dev", 100, "cash", null, 1)
       .run();
@@ -481,9 +481,9 @@ describe("batched notification de-duplication", () => {
     await DB.batch(
       ids.map((id) =>
         DB.prepare(
-          "INSERT INTO subscriptions (id, user_id, zip, ntfy_topic, min_gallons, payment_type, threshold, active) VALUES (?,?,?,?,?,?,?,?)",
+          "INSERT INTO subscriptions (id, user_id, zip, destination, min_gallons, payment_type, threshold, active) VALUES (?,?,?,?,?,?,?,?)",
         // `user_id` varies: subscriptions carry a UNIQUE
-        // (user_id, zip, ntfy_topic, payment_type, min_gallons).
+        // (user_id, zip, destination, payment_type, min_gallons).
         ).bind(id, `v${id}`, ZIP, "heating-oil-local-dev", 100, "cash", null, 1),
       ),
     );

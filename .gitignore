@@ -7,3 +7,4 @@ dist/
 .review/
 docs/deployment-log.md
 .dev.vars
+tail-capture.txt

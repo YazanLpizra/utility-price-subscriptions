@@ -216,7 +216,7 @@ describe("CHECK constraints bite", () => {
     await seedZip();
     expect(
       await rejects(
-        "INSERT INTO subscriptions (user_id, zip, ntfy_topic, min_gallons, payment_type) VALUES (?,?,?,?,?)",
+        "INSERT INTO subscriptions (user_id, zip, destination, min_gallons, payment_type) VALUES (?,?,?,?,?)",
         "yazan",
         "06483",
         "topic-a",
@@ -281,7 +281,7 @@ describe("subscriptions: ux_subs_natural", () => {
   it("rejects a second subscription with the same natural key", async () => {
     await seedZip();
     const sql =
-      "INSERT INTO subscriptions (user_id, zip, ntfy_topic, min_gallons, payment_type, threshold) VALUES (?,?,?,?,?,?)";
+      "INSERT INTO subscriptions (user_id, zip, destination, min_gallons, payment_type, threshold) VALUES (?,?,?,?,?,?)";
     const args: unknown[] = ["yazan", "06483", "yazan-06483-oil", 150, "cash", null];
     await DB.prepare(sql)
       .bind(...args)
@@ -303,7 +303,7 @@ describe("notifications table", () => {
   it("exists and de-duplicates on (scrape_date, subscription_id)", async () => {
     await seedZip();
     await DB.prepare(
-      "INSERT INTO subscriptions (id, user_id, zip, ntfy_topic, min_gallons, payment_type) VALUES (1,?,?,?,?,?)",
+      "INSERT INTO subscriptions (id, user_id, zip, destination, min_gallons, payment_type) VALUES (1,?,?,?,?,?)",
     )
       .bind("yazan", "06483", "yazan-06483-oil", 150, "cash")
       .run();
@@ -413,7 +413,7 @@ describe("CHECK constraints: every clause in the migration", () => {
     subscriptions: {
       user_id: "v1",
       zip: "06483",
-      ntfy_topic: "heating-oil-local-dev",
+      destination: "heating-oil-local-dev",
       min_gallons: 100,
       payment_type: "cash",
       threshold: null,

@@ -11,8 +11,11 @@
   "triggers": { "crons": ["0 12 * * *"] },
   "vars": {
     "SITE_BASE_URL": "https://www.cashheatingoil.com",
-    "NTFY_BASE_URL": "https://ntfy.sh",
     "STALE_AFTER_DAYS": "3",
+    // Transport. TELEGRAM_BOT_TOKEN and ALERT_DESTINATION are SECRETS, set with
+    // `wrangler secret put` — never vars here, because a var of the same name
+    // shares the binding namespace and overwrites the secret on every deploy.
+    "NOTIFY_PROVIDER": "telegram",
     "USER_AGENT": "heating-oil-tracker/1.0 (+personal price tracker)"
   },
   "d1_databases": [

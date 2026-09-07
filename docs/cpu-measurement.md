@@ -103,16 +103,64 @@ Applied to the median parse CPU time from the authoritative (production) measure
 **Cheerio stays rejected regardless of where the number lands.** Even a comfortable HTMLRewriter
 number does not reopen that choice, and an uncomfortable one is even less of a reason to switch:
 Cheerio builds a full DOM in JS (strictly more CPU per byte, not less) and would additionally
-require enabling `nodejs_compat`, which this project does not otherwise need. If CPU pressure ever
-does force a redesign, the fix is splitting the parse work across invocations, not changing
-parsers.
+require enabling `nodejs_compat`, which this project does not otherwise need.
+
+## Where the CPU actually went — and what to do if we hit the limit again
+
+**Read this first if CPU ever becomes a problem again.** The original guidance here said the fix
+would be "splitting the parse work across invocations, not changing parsers." That turned out to be
+wrong, and measurement is what showed it.
+
+Profiled against the real fixture inside workerd:
+
+| step | cost |
+|---|---|
+| drain the response body, no parsing | 0.20 ms |
+| `HTMLRewriter` with **zero** handlers | **0.33 ms** |
+| + one element-only selector | 0.63 ms |
+| + one `td` **text** handler (~80 cells) | **5.47 ms** |
+| full parse, 11 selectors, 4 with text handlers | 17.13 ms |
+
+The native tokenizer is essentially free. Practically all of the cost was **one JS callback per text
+node** — dispatch across the runtime/JS boundary, not parsing. That qualifies PRD §9.2: its claim
+that HTMLRewriter wins because it "runs in native code rather than JS" is true of the tokenizer and
+false of handler dispatch, which is what dominated.
+
+So the fix was neither splitting work nor swapping in Cheerio. It was to stop routing ~80 dense,
+highly regular price cells through text handlers, and read them with a single linear string scan of
+the body we already hold in memory (`extractPriceTables()` in `src/parser.ts`).
+
+**If CPU pressure returns, investigate the string-scanning mechanism first.** Concretely:
+
+1. **Re-profile before optimising.** The table above is the method: time `HTMLRewriter` with no
+   handlers, then add selectors one at a time. Cost tracks the number of text-node callbacks, not
+   document size.
+2. **The remaining budget is the metadata label handlers.** `label.formtxt` and `label.varlabel`
+   still use text handlers and are now the largest remaining item in the ~7.6 ms parse. They can be
+   moved to the same string-scanning approach — scan each listing's region for the caption/value
+   pairs — which is the obvious next win if one is needed.
+3. **Extend the scan, do not replace the parser wholesale.** HTMLRewriter still earns its place for
+   structure: listings, order forms, and hidden inputs are element-only handlers and cheap. Keeping
+   it there preserves real HTML parsing for the parts where markup drift is most likely to matter.
+4. **Keep the cross-checks.** String scanning is more brittle than a parser, so the correspondence
+   between scanned tables and parsed forms is asserted (counts must match, and each table's class
+   must agree with the class HTMLRewriter saw). Any further scanning must come with equivalent
+   assertions, or drift will silently produce wrong prices instead of a `ParseError`.
+5. **Only then consider the alternatives.** Splitting across invocations does not help, because the
+   parse cannot be split. WASM does not help either: HTMLRewriter is already native Rust (lol-html)
+   inside workerd, so a WASM parser would duplicate it at a bundle-size and instantiation cost while
+   still paying boundary crossings. The certain non-code fix is the Workers Paid plan, which raises
+   the ceiling from 10 ms to a 30 s default.
 
 ## Results
 
 | date | environment | median ms | p95 ms | notes |
 |---|---|---|---|---|
-| | local (workerd, `performance.now()`) | | | |
-| | production (Workers observability, queue consumer) | | | |
+| 2026-09-06 | local (workerd, `performance.now()`) | 19.0 | 23.0 | original parser, all cells via HTMLRewriter text handlers |
+| 2026-09-06 | production (`wrangler tail`, queue consumer) | 12–16 | — | same build; **over the 10 ms free-tier ceiling**, though runs completed `outcome: ok` |
+| 2026-09-06 | production (`wrangler tail`, cron producer) | 2 | — | producer only enqueues; never the constraint |
+| 2026-09-06 | local (workerd, `performance.now()`) | 16.0 | 20.0 | after removing ~80 per-cell `onEndTag` closures and single-passing `norm()` — only ~16%, which is what prompted the profile above |
+| 2026-09-06 | local (workerd, `performance.now()`) | **7.62** | — | after moving price cells to `extractPriceTables()`; the scan itself is **0.13 ms** vs ~11 ms of handler dispatch |
 
 This document blocks no phase. The local numbers above are filled in by whoever runs the
 in-process measurement; the authoritative production row is filled in once this project is

@@ -1,9 +1,9 @@
 # Heating Oil Price Tracker
 
 A Cloudflare Worker that scrapes [cashheatingoil.com](https://www.cashheatingoil.com) once a
-day for one or more zip codes, stores every dealer's cash/credit price tier in D1, and pushes an
-[ntfy](https://ntfy.sh) notification to each subscriber when a price qualifies for their order
-size. Full requirements and rationale live in
+day for one or more zip codes, stores every dealer's cash/credit price tier in D1, and pushes a
+Telegram message to each subscriber when a price qualifies for their order size. Full
+requirements and rationale live in
 [`docs/heating-oil-tracker-prd.md`](docs/heating-oil-tracker-prd.md); the phase-by-phase build
 record is in [`docs/implementation-plan.md`](docs/implementation-plan.md).
 
@@ -35,15 +35,16 @@ npm test
   vitest plugin, and `@cloudflare/workers-types`). Zero runtime dependencies.
 - `npm run fixture` — de-wraps the saved view-source capture in `docs/` into
   `test/fixtures/06483.html` and prints structural counts plus a SHA-256.
-- `npm run migrate:local` — applies `migrations/0001_init.sql` to a local D1 instance under
-  `.wrangler/state`.
+- `npm run migrate:local` — applies both `migrations/0001_init.sql` and
+  `migrations/0002_notification_destination.sql` to a local D1 instance under `.wrangler/state`.
+  The second migration renames `subscriptions.ntfy_topic` to `subscriptions.destination`.
 - `npm run seed:local` — applies `seeds/dev-seed.sql`: 4 zips, all inactive, and 2 subscriptions.
-- `npm test` — runs the full Vitest suite (249 tests) against local D1 and HTMLRewriter, both the
+- `npm test` — runs the full Vitest suite (251 tests) against local D1 and HTMLRewriter, both the
   real workerd implementations via `@cloudflare/vitest-plugin`, not mocks.
 
 > **This entire sequence is offline.** Every seeded zip has `active = 0` (see
 > `seeds/dev-seed.sql`), and the cron producer only enqueues active zips. With the seed as
-> committed, a local run enqueues nothing, so nothing reaches `cashheatingoil.com` or `ntfy.sh`.
+> committed, a local run enqueues nothing, so nothing reaches `cashheatingoil.com` or Telegram.
 > You can run all five commands with the network unplugged and they will pass. That property is
 > worth preserving — don't activate a zip in the committed seed.
 

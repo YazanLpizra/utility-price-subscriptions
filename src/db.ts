@@ -234,7 +234,7 @@ export async function getActiveSubscriptions(
 ): Promise<Subscription[]> {
   const result = await db
     .prepare(
-      "SELECT id, user_id, zip, ntfy_topic, min_gallons, payment_type, threshold, active " +
+      "SELECT id, user_id, zip, destination, min_gallons, payment_type, threshold, active " +
         "FROM subscriptions WHERE zip = ? AND active = 1 ORDER BY id",
     )
     .bind(zip)
@@ -266,7 +266,7 @@ export async function recordNotified(
   fingerprint: string,
   sentAt: string,
 ): Promise<void> {
-  // Queues delivery is at-least-once. A retry after a *successful* ntfy push must
+  // Queues delivery is at-least-once. A retry after a *successful* push must
   // not turn into a constraint error that fails the whole invocation, and must not
   // overwrite the fingerprint that was actually sent — hence DO NOTHING, not
   // DO UPDATE.

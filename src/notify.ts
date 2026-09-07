@@ -1,5 +1,5 @@
 /**
- * Phase 5 — subscription evaluation, staleness, ntfy transport.
+ * Phase 5 — subscription evaluation, staleness, and notification delivery.
  *
  * This module is deliberately pure except for the two transport functions, and it
  * imports NOTHING but `./types`. No D1 access lives here: `selectBestPrice`,
@@ -17,20 +17,10 @@ import type {
   BestPrice,
   Env,
   NotificationDecision,
-  NtfyMessage,
+  NotificationMessage,
   ParsedListing,
   Subscription,
 } from "./types";
-
-/**
- * The one grammar for an ntfy topic, used by both `sendNtfy` and `sendAlert`.
- *
- * On unauthenticated ntfy the topic name IS the credential, and a subscriber
- * topic is user-supplied data read out of D1. A value containing `/`, `..`, `?`
- * or a newline would let it address a different ntfy endpoint or inject a
- * header, so it is rejected before any request is issued.
- */
-const TOPIC_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 /** ISO `yyyy-mm-dd` — the only date shape this module accepts. */
 const ISO_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -211,7 +201,7 @@ export function buildNotification(
   decision: NotificationDecision,
   zip: string,
   scrapeDate: string,
-): NtfyMessage {
+): NotificationMessage {
   const { best, stale } = decision;
   const sub = decision.subscription;
 
@@ -290,105 +280,107 @@ export function notificationFingerprint(decision: NotificationDecision): string 
 }
 
 /**
- * The one place a request is actually issued. Shared by `sendNtfy` and
- * `sendAlert` so the topic validation, the encoding and the never-throw
- * guarantee cannot drift apart between them.
+ * A Telegram chat id: digits, optionally negative for groups and channels.
+ * Validated because it is user-supplied data read out of D1 and interpolated
+ * into a request body.
  */
-async function postToNtfy(
+const CHAT_ID_RE = /^-?\d{1,20}$/;
+
+/**
+ * Telegram transport.
+ *
+ * WHY TELEGRAM: the original design used ntfy.sh, which meters anonymous
+ * publishing per source IP. Cloudflare Workers egress from shared IPs whose
+ * daily quota is routinely already spent by other tenants, so production
+ * pushes returned 429 while the identical payload succeeded from a home IP.
+ * An ntfy access token did not fix it either — `/v1/account` reports
+ * `limits.basis = "ip"` for free accounts. Telegram meters per bot token,
+ * which is ours alone. (Recorded so nobody reintroduces ntfy expecting the
+ * token to be the missing piece.)
+ *
+ * Sent as plain text with no `parse_mode`: prices contain `$`, `.` and `-`,
+ * all of which are MarkdownV2 metacharacters, and a formatting error would be
+ * a 400 rather than a delivered message.
+ */
+async function postToTelegram(
   env: Env,
-  topic: string,
-  msg: NtfyMessage,
+  chatId: string,
+  msg: NotificationMessage,
   fetchImpl: typeof fetch,
 ): Promise<boolean> {
-  // Validate BEFORE constructing a URL or touching the network.
-  if (typeof topic !== "string" || !TOPIC_RE.test(topic)) return false;
+  const token = env.TELEGRAM_BOT_TOKEN?.trim();
+  if (!token) {
+    console.error("[telegram] no TELEGRAM_BOT_TOKEN configured; cannot send");
+    return false;
+  }
+  if (typeof chatId !== "string" || !CHAT_ID_RE.test(chatId.trim())) {
+    console.error("[telegram] refusing to send to a malformed chat id");
+    return false;
+  }
 
   try {
-    // Encoded even though the validator already excludes every character that
-    // would need encoding: correct by construction, not by the validator
-    // happening to stay strict.
-    const url = `${env.NTFY_BASE_URL}/${encodeURIComponent(topic)}`;
-    const headers: Record<string, string> = {
-      Title: msg.title,
-      Tags: msg.tags.join(","),
-      Priority: String(msg.priority),
-    };
-    // Authenticate when a token is configured. ntfy meters anonymous publishing
-    // per source IP; Workers share egress IPs, so unauthenticated pushes from
-    // production get 429 "daily message quota reached" regardless of our own
-    // volume. The token moves metering to the owning account. It is a secret:
-    // never log it, and never put it in wrangler.jsonc vars.
-    // Trimmed: `wrangler secret put` reads stdin, and piping a value through a
-    // shell very easily stores a trailing newline. An untrimmed token produces
-    // a malformed header and a 401 that looks exactly like a bad credential —
-    // which cost a diagnosis cycle here.
-    const token = env.NTFY_TOKEN?.trim();
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-    const res = await fetchImpl(url, {
+    const base = (env.TELEGRAM_API_BASE ?? "https://api.telegram.org").replace(/\/+$/, "");
+    const res = await fetchImpl(`${base}/bot${token}/sendMessage`, {
       method: "POST",
-      headers,
-      body: msg.body,
-      // A stalled ntfy connection would otherwise hold a queue invocation open
-      // against its 15-minute ceiling. `src/fetcher.ts` already bounds the site
-      // fetch the same way; ntfy is the shorter hop, so 10s is generous.
-      // The abort surfaces as a rejection, which the catch below turns into
-      // `false` — the never-throw guarantee is unchanged.
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId.trim(),
+        text: `${msg.title}
+
+${msg.body}`,
+        disable_notification: msg.priority <= 2,
+      }),
       signal: AbortSignal.timeout(10_000),
     });
     if (res.status >= 200 && res.status < 300) return true;
-    // Log WHY. Without this a failed push is indistinguishable from a
-    // suppressed one, which cost real time to diagnose in production. The
-    // status and a short body excerpt are enough to tell a rate limit from a
-    // rejected payload; the topic is never logged, because on unauthenticated
-    // ntfy it is the credential.
     let excerpt = "";
     try {
       excerpt = (await res.text()).slice(0, 200);
     } catch {
       excerpt = "<unreadable body>";
     }
+    // The bot token is part of the URL, so the URL is NEVER logged.
     console.error(
-      `[ntfy] push rejected: status=${res.status} ${res.statusText} body=${excerpt}`,
+      `[telegram] send rejected: status=${res.status} ${res.statusText} body=${excerpt}`,
     );
     return false;
   } catch (err) {
-    // PRD §8: a failed push must not lose data that is already written, so a
-    // transport failure — timeout included — is a `false`, never an exception.
-    // The topic is never logged: on unauthenticated ntfy it is the credential.
     console.error(
-      `[ntfy] push threw: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`,
+      `[telegram] send threw: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`,
     );
     return false;
   }
 }
 
 /**
- * POSTs to `${env.NTFY_BASE_URL}/${encodeURIComponent(topic)}`.
- * Rejects (returns false, never throws) a topic not matching /^[A-Za-z0-9_-]{1,64}$/
- * before issuing any request. Never throws; returns false on failure (PRD 8).
+ * Sends one message to `destination` — a Telegram chat id.
+ *
+ * The `subscriptions.destination` column holds the same thing, which is why it
+ * is no longer called `ntfy_topic`. Kept as a named indirection so a second
+ * provider can be added without touching the orchestration layer.
  */
-export function sendNtfy(
+export function sendNotification(
   env: Env,
-  topic: string,
-  msg: NtfyMessage,
+  destination: string,
+  msg: NotificationMessage,
   fetchImpl: typeof fetch = globalThis.fetch,
 ): Promise<boolean> {
-  return postToNtfy(env, topic, msg, fetchImpl);
+  return postToTelegram(env, destination, msg, fetchImpl);
 }
 
-/** Operational alert to env.NTFY_ALERT_TOPIC at priority 4, tag "warning". Never throws. */
+/** Operational alert to env.ALERT_DESTINATION at priority 4, tag "warning". Never throws. */
 export function sendAlert(
   env: Env,
   title: string,
   body: string,
   fetchImpl: typeof fetch = globalThis.fetch,
 ): Promise<boolean> {
-  // In production NTFY_ALERT_TOPIC arrives as a Cloudflare secret (Phase 9),
+  // In production ALERT_DESTINATION arrives as a Cloudflare secret (Phase 9),
   // not from the placeholder in wrangler.jsonc. It is an ordinary string here
   // and its value is never logged.
-  return postToNtfy(
+  return sendNotification(
     env,
-    env.NTFY_ALERT_TOPIC,
+    env.ALERT_DESTINATION,
     {
       title: `heating-oil-tracker: ${title}`,
       body,

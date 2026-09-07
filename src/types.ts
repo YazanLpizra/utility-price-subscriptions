@@ -55,7 +55,7 @@ export interface Subscription {
   id: number;
   user_id: string;
   zip: string;
-  ntfy_topic: string;
+  destination: string;
   min_gallons: number;
   payment_type: PaymentType;
   threshold: number | null;
@@ -94,12 +94,12 @@ export interface NotificationDecision {
   should_send: boolean;
 }
 
-/** Payload handed to the ntfy transport. */
-export interface NtfyMessage {
+/** Payload handed to the notification transport. */
+export interface NotificationMessage {
   title: string;
   body: string;
   tags: string[];
-  priority: number;           // ntfy 1..5
+  priority: number;           // 1..5; <=2 sends silently
 }
 
 /** Result of resolving + fetching a zip's results page. */
@@ -126,10 +126,8 @@ export interface Env {
   SCRAPE_QUEUE: Queue<ScrapeMessage>;
   /** e.g. "https://www.cashheatingoil.com" — no trailing slash. */
   SITE_BASE_URL: string;
-  /** e.g. "https://ntfy.sh" — no trailing slash. */
-  NTFY_BASE_URL: string;
-  /** topic that receives parse-failure / error alerts (PRD 8). */
-  NTFY_ALERT_TOPIC: string;
+  /** destination that receives parse-failure / error alerts (PRD 8). A SECRET. */
+  ALERT_DESTINATION: string;
   /** stringified integer N; notification annotated stale when data is older than N days. */
   STALE_AFTER_DAYS: string;
   /**
@@ -139,12 +137,17 @@ export interface Env {
    */
   NOTIFY_DEDUPE?: string;
   /**
-   * ntfy access token, supplied as a Cloudflare SECRET — never a var, and never
-   * committed. Without it ntfy meters anonymous publishing per source IP, and
-   * Workers egress from shared IPs whose daily quota is routinely already spent
-   * by other tenants; production pushes came back 429 until this was added.
-   * With it, metering moves to the account that owns the token.
+   * Which transport delivers notifications. Only "telegram" is implemented;
+   * the field is kept so a second provider can be added without a schema or
+   * orchestration change.
    */
-  NTFY_TOKEN?: string;
+  NOTIFY_PROVIDER?: string;
+  /**
+   * Telegram bot token, supplied as a Cloudflare SECRET — never a var, never
+   * committed. It appears in the request URL, so that URL is never logged.
+   */
+  TELEGRAM_BOT_TOKEN?: string;
+  /** Override for tests; defaults to "https://api.telegram.org". */
+  TELEGRAM_API_BASE?: string;
   USER_AGENT: string;
 }

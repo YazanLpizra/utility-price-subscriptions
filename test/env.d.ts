@@ -1,6 +1,18 @@
 declare namespace Cloudflare {
   interface Env {
     TEST_MIGRATIONS: D1Migration[];
+    /**
+     * Bindings that are NOT vars in wrangler.jsonc — a var there would share the
+     * binding namespace with secrets and overwrite `wrangler secret put` on
+     * every deploy. In production these arrive as secrets; in tests they come
+     * from vitest.config.ts's miniflare bindings, so they are declared here
+     * rather than in the generated worker-configuration.d.ts.
+     */
+    ALERT_DESTINATION: string;
+    NOTIFY_DEDUPE: string;
+    NOTIFY_PROVIDER?: string;
+    TELEGRAM_BOT_TOKEN?: string;
+    TELEGRAM_API_BASE?: string;
   }
 }
 

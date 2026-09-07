@@ -25,8 +25,7 @@ const POST_URL = `${BASE}/cod_oil_prices.php`;
 
 const env = {
   SITE_BASE_URL: BASE,
-  NTFY_BASE_URL: "https://ntfy.sh",
-  NTFY_ALERT_TOPIC: "test-topic",
+  ALERT_DESTINATION: "test-topic",
   STALE_AFTER_DAYS: "3",
   USER_AGENT: UA,
 } as unknown as Env;
