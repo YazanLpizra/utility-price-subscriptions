@@ -514,8 +514,8 @@ describe("batched notification de-duplication", () => {
     it("reads every recorded fingerprint in one call", async () => {
       await seedSubs([1, 2, 3]);
       await recordNotifiedBatch(DB, [
-        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-1", sent_at: SCRAPED_AT },
-        { scrape_date: SCRAPE_DATE, subscription_id: 3, fingerprint: "fp-3", sent_at: SCRAPED_AT },
+        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-1", sent_at: SCRAPED_AT, price_per_gallon: 4.84, reason: "price_moved" },
+        { scrape_date: SCRAPE_DATE, subscription_id: 3, fingerprint: "fp-3", sent_at: SCRAPED_AT, price_per_gallon: 4.84, reason: "price_moved" },
       ]);
 
       const map = await getNotifiedFingerprints(DB, SCRAPE_DATE, [1, 2, 3]);
@@ -529,8 +529,8 @@ describe("batched notification de-duplication", () => {
     it("is scoped to the day and to the requested ids", async () => {
       await seedSubs([1, 2]);
       await recordNotifiedBatch(DB, [
-        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-1", sent_at: SCRAPED_AT },
-        { scrape_date: SCRAPE_DATE, subscription_id: 2, fingerprint: "fp-2", sent_at: SCRAPED_AT },
+        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-1", sent_at: SCRAPED_AT, price_per_gallon: 4.84, reason: "price_moved" },
+        { scrape_date: SCRAPE_DATE, subscription_id: 2, fingerprint: "fp-2", sent_at: SCRAPED_AT, price_per_gallon: 4.84, reason: "price_moved" },
       ]);
 
       expect((await getNotifiedFingerprints(DB, "2026-09-07", [1, 2])).size).toBe(0);
@@ -547,8 +547,8 @@ describe("batched notification de-duplication", () => {
     it("writes every row in one call", async () => {
       await seedSubs([1, 2]);
       await recordNotifiedBatch(DB, [
-        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-1", sent_at: SCRAPED_AT },
-        { scrape_date: SCRAPE_DATE, subscription_id: 2, fingerprint: "fp-2", sent_at: SCRAPED_AT },
+        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-1", sent_at: SCRAPED_AT, price_per_gallon: 4.84, reason: "price_moved" },
+        { scrape_date: SCRAPE_DATE, subscription_id: 2, fingerprint: "fp-2", sent_at: SCRAPED_AT, price_per_gallon: 4.84, reason: "price_moved" },
       ]);
 
       const r = await DB.prepare("SELECT COUNT(*) AS c FROM notifications").first<{ c: number }>();
@@ -560,7 +560,7 @@ describe("batched notification de-duplication", () => {
     it("UPDATES an existing row when the fingerprint differs", async () => {
       await seedSubs([1]);
       await recordNotifiedBatch(DB, [
-        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-old", sent_at: SCRAPED_AT },
+        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-old", sent_at: SCRAPED_AT, price_per_gallon: 4.84, reason: "price_moved" },
       ]);
 
       // The price moved and a second push really was made the same day. The row
@@ -568,7 +568,7 @@ describe("batched notification de-duplication", () => {
       // next comparison is made against a fingerprint that was superseded.
       const later = "2026-09-06T18:00:00.000Z";
       await recordNotifiedBatch(DB, [
-        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-new", sent_at: later },
+        { scrape_date: SCRAPE_DATE, subscription_id: 1, fingerprint: "fp-new", sent_at: later, price_per_gallon: 4.84, reason: "price_moved" },
       ]);
 
       const row = await DB.prepare(
@@ -590,6 +590,8 @@ describe("batched notification de-duplication", () => {
         subscription_id: 1,
         fingerprint: "fp-1",
         sent_at: SCRAPED_AT,
+        price_per_gallon: 4.84,
+        reason: "price_moved",
       };
       await recordNotifiedBatch(DB, [row]);
       await expect(recordNotifiedBatch(DB, [row])).resolves.toBeUndefined();
@@ -608,6 +610,8 @@ describe("batched notification de-duplication", () => {
           subscription_id: id,
           fingerprint: `fp-${id}`,
           sent_at: SCRAPED_AT,
+        price_per_gallon: 4.84,
+        reason: "price_moved",
         })),
       );
 

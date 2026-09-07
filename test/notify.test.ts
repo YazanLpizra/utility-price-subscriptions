@@ -20,6 +20,8 @@ import {
   selectBestPrice,
   sendAlert,
   sendNotification,
+  shouldNotify,
+  triggerSummary,
 } from "../src/notify";
 import type {
   Env,
@@ -621,5 +623,199 @@ describe("transport hardening", () => {
     const { impl } = stubFetch(() => new Response('{"ok":true}', { status: 200 }));
     expect(await sendNotification(tgEnv, "5838650961", msg, impl)).toBe(true);
     expect(await sendNotification(tgEnv, "-1001234567890", msg, impl)).toBe(true);
+  });
+});
+
+// ------------------------------------------------- when is a push warranted
+
+describe("shouldNotify", () => {
+  const DATE = "2026-09-20";
+  const base = { minDelta: 0.05, digestAfterDays: 7 };
+
+  const at = (price: number) =>
+    evaluateSubscription(
+      [
+        {
+          dealer_id: 11,
+          delivery_date: "2026-09-21",
+          price_updated_on: DATE,
+          same_day_charge: 0,
+          tiers: [tier("cash", 150, 199, price)],
+        },
+      ],
+      sub({ min_gallons: 150 }),
+      DATE,
+      3,
+    );
+
+  const ctx = (over: Partial<Parameters<typeof shouldNotify>[1]>) => ({
+    lastNotifiedPrice: null,
+    lastNotifiedDate: null,
+    historicalMinPrice: null,
+    ...base,
+    ...over,
+  });
+
+  it("sends the first ever reading, which sets the anchor", () => {
+    const t = shouldNotify(at(4.8), ctx({}), DATE);
+    expect(t.send).toBe(true);
+    expect(t.reason).toBe("first_ever");
+  });
+
+  it("stays silent when the price has not moved", () => {
+    const t = shouldNotify(
+      at(4.8),
+      ctx({ lastNotifiedPrice: 4.8, lastNotifiedDate: "2026-09-19" }),
+      DATE,
+    );
+    expect(t.send).toBe(false);
+    expect(t.reason).toBe("unchanged");
+  });
+
+  it("stays silent for a move below the threshold", () => {
+    const t = shouldNotify(
+      at(4.82),
+      ctx({ lastNotifiedPrice: 4.8, lastNotifiedDate: "2026-09-19" }),
+      DATE,
+    );
+    expect(t.send).toBe(false);
+    expect(t.delta).toBe(0.02);
+  });
+
+  it("sends on a fall of at least the threshold", () => {
+    const t = shouldNotify(
+      at(4.75),
+      ctx({ lastNotifiedPrice: 4.8, lastNotifiedDate: "2026-09-19" }),
+      DATE,
+    );
+    expect(t.send).toBe(true);
+    expect(t.reason).toBe("price_moved");
+    expect(t.delta).toBe(-0.05);
+  });
+
+  it("sends on a RISE too — waiting costs money when you must buy soon", () => {
+    const t = shouldNotify(
+      at(4.9),
+      ctx({ lastNotifiedPrice: 4.8, lastNotifiedDate: "2026-09-19" }),
+      DATE,
+    );
+    expect(t.send).toBe(true);
+    expect(t.reason).toBe("price_moved");
+    expect(t.delta).toBe(0.1);
+  });
+
+  /**
+   * The reason the anchor is sticky. A per-day delta would see five separate
+   * 2-cent moves and stay silent forever while the price drifted 10 cents.
+   */
+  it("catches a slow drift that no per-day delta would ever see", () => {
+    let anchor = 4.8;
+    const walk = [4.82, 4.84, 4.86, 4.88, 4.9];
+    const fired: number[] = [];
+
+    walk.forEach((price, i) => {
+      const t = shouldNotify(
+        at(price),
+        ctx({ lastNotifiedPrice: anchor, lastNotifiedDate: "2026-09-19" }),
+        DATE,
+      );
+      if (t.send) {
+        fired.push(i);
+        anchor = price; // the anchor only moves when we actually notify
+      }
+    });
+
+    // Day 3 (4.86) is the first to be a full 5 cents from the 4.80 anchor.
+    expect(fired).toEqual([2]);
+    expect(anchor).toBe(4.86);
+  });
+
+  it("sends on a new low even when the move is small", () => {
+    const t = shouldNotify(
+      at(4.79),
+      ctx({
+        lastNotifiedPrice: 4.8,
+        lastNotifiedDate: "2026-09-19",
+        historicalMinPrice: 4.8,
+      }),
+      DATE,
+    );
+    expect(t.send).toBe(true);
+    expect(t.reason).toBe("new_low");
+    expect(t.isNewLow).toBe(true);
+  });
+
+  it("does not call it a new low when the price only ties the record", () => {
+    const t = shouldNotify(
+      at(4.8),
+      ctx({
+        lastNotifiedPrice: 4.8,
+        lastNotifiedDate: "2026-09-19",
+        historicalMinPrice: 4.8,
+      }),
+      DATE,
+    );
+    expect(t.isNewLow).toBe(false);
+    expect(t.send).toBe(false);
+  });
+
+  it("sends a check-in once the silence reaches the digest interval", () => {
+    const t = shouldNotify(
+      at(4.8),
+      ctx({ lastNotifiedPrice: 4.8, lastNotifiedDate: "2026-09-13" }),
+      DATE,
+    );
+    expect(t.send).toBe(true);
+    expect(t.reason).toBe("periodic_digest");
+    expect(t.daysSinceLast).toBe(7);
+  });
+
+  it("does not send a check-in a day early", () => {
+    const t = shouldNotify(
+      at(4.8),
+      ctx({ lastNotifiedPrice: 4.8, lastNotifiedDate: "2026-09-14" }),
+      DATE,
+    );
+    expect(t.send).toBe(false);
+    expect(t.daysSinceLast).toBe(6);
+  });
+
+  it("never sends when the decision itself was suppressed", () => {
+    const suppressed = evaluateSubscription(
+      listings(),
+      sub({ min_gallons: 5000 }),
+      DATE,
+      3,
+    );
+    expect(suppressed.should_send).toBe(false);
+    expect(shouldNotify(suppressed, ctx({}), DATE).send).toBe(false);
+  });
+
+  it("explains itself in one sentence", () => {
+    const moved = shouldNotify(
+      at(4.7),
+      ctx({ lastNotifiedPrice: 4.8, lastNotifiedDate: "2026-09-19" }),
+      DATE,
+    );
+    expect(triggerSummary(moved)).toContain("down 0.10");
+    const first = shouldNotify(at(4.8), ctx({}), DATE);
+    expect(triggerSummary(first)).toMatch(/first reading/i);
+  });
+
+  it("puts the movement in the title, where a lock screen shows it", () => {
+    const decision = at(4.73);
+    const t = shouldNotify(
+      decision,
+      ctx({
+        lastNotifiedPrice: 4.8,
+        lastNotifiedDate: "2026-09-19",
+        historicalMinPrice: 4.75,
+      }),
+      DATE,
+    );
+    const msg = buildNotification(decision, "06483", DATE, t);
+    expect(msg.title).toContain("down 0.07");
+    expect(msg.title).toContain("lowest yet");
+    expect(msg.body).toContain("lowest I have recorded");
   });
 });

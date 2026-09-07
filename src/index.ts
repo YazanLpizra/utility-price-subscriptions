@@ -63,8 +63,11 @@ import {
   clearZipSlug,
   getActiveSubscriptions,
   getActiveZips,
+  getLastNotifications,
+  getTierLows,
   getNotifiedFingerprints,
   getZip,
+  tierLowFor,
   recordNotifiedBatch,
   updateZipSlug,
   writePriceRows,
@@ -78,9 +81,27 @@ import {
   isStale,
   notificationFingerprint,
   sendAlert,
+  shouldNotify,
   sendNotification,
 } from "./notify";
-import type { Env, FetchedPage, ScrapeMessage } from "./types";
+import type { TriggerDecision } from "./notify";
+import type {
+  Env,
+  FetchedPage,
+  NotificationDecision,
+  ScrapeMessage,
+  Subscription,
+} from "./types";
+
+/** Cents per gallon of movement that is worth interrupting someone for. */
+const DEFAULT_MIN_DELTA = 0.05;
+/** Send an unconditional check-in when nothing has been sent for this long. */
+const DEFAULT_DIGEST_DAYS = 7;
+
+function numberFrom(raw: string | undefined, fallback: number): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 
 /** The complete, exhaustive result shape. Every branch returns all four fields. */
 export interface ProcessZipResult {
@@ -374,30 +395,74 @@ export async function processZip(
   // confirmed working.
   const dedupeEnabled = env.NOTIFY_DEDUPE !== "0";
 
+  const subIds = sendable.map((candidate) => candidate.sub.id);
+
+  // Same-day dedupe: a queue retry, or a manual re-run, must not re-push a
+  // message the phone already holds.
   const alreadySent = dedupeEnabled
-    ? await getNotifiedFingerprints(
-        env.DB,
-        scrapeDate,
-        sendable.map((candidate) => candidate.sub.id),
-      )
+    ? await getNotifiedFingerprints(env.DB, scrapeDate, subIds)
     : new Map<number, string>();
 
-  const pending = dedupeEnabled
-    ? sendable.filter(({ sub, decision }) => {
-        const recorded = alreadySent.get(sub.id);
-        return recorded === undefined || recorded !== notificationFingerprint(decision);
-      })
-    : sendable;
+  // Cross-day policy: the anchor each subscriber's price is measured against.
+  // Read regardless of the dedupe flag, because it decides whether a message is
+  // worth sending at all rather than whether it is a duplicate.
+  const lastNotifications = await getLastNotifications(env.DB, subIds);
+
+  // Every tier's historical low in ONE query, so the read cost does not grow
+  // with the number of subscriptions.
+  const tierLows = await getTierLows(env.DB, zip, scrapeDate);
+
+  const minDelta = numberFrom(env.NOTIFY_MIN_DELTA, DEFAULT_MIN_DELTA);
+  const digestAfterDays = numberFrom(env.NOTIFY_DIGEST_DAYS, DEFAULT_DIGEST_DAYS);
+
+  const pending: Array<{
+    sub: Subscription;
+    decision: NotificationDecision;
+    trigger: TriggerDecision;
+  }> = [];
+
+  for (const { sub, decision } of sendable) {
+    if (dedupeEnabled) {
+      const recorded = alreadySent.get(sub.id);
+      if (recorded !== undefined && recorded === notificationFingerprint(decision)) {
+        continue; // identical message already sent today
+      }
+    }
+
+    const last = lastNotifications.get(sub.id) ?? null;
+    const historicalMinPrice = tierLowFor(tierLows, sub.payment_type, sub.min_gallons);
+
+    const trigger = shouldNotify(
+      decision,
+      {
+        lastNotifiedPrice: last?.price_per_gallon ?? null,
+        lastNotifiedDate: last?.scrape_date ?? null,
+        historicalMinPrice,
+        minDelta,
+        digestAfterDays,
+      },
+      scrapeDate,
+    );
+
+    if (!trigger.send) {
+      console.log(
+        `[processZip] ${zip}: subscription ${sub.id} suppressed (${trigger.reason}, ` +
+          `delta=${trigger.delta ?? "n/a"})`,
+      );
+      continue;
+    }
+    pending.push({ sub, decision, trigger });
+  }
 
   // 9. notify, bounded at 6 concurrent outbound requests (PRD §9.1).
   const settled = await mapWithConcurrency(
     pending,
     MAX_NOTIFY_CONCURRENCY,
-    async ({ sub, decision }): Promise<NotifiedRow | null> => {
+    async ({ sub, decision, trigger }): Promise<NotifiedRow | null> => {
       const sent = await sendNotification(
         env,
         sub.destination,
-        buildNotification(decision, zip, scrapeDate),
+        buildNotification(decision, zip, scrapeDate, trigger),
         fetchImpl,
       );
       // A false return is logged, never thrown: the data is already in D1.
@@ -412,6 +477,11 @@ export async function processZip(
         subscription_id: sub.id,
         fingerprint: notificationFingerprint(decision),
         sent_at: new Date().toISOString(),
+        // This is what moves the anchor. It is written only on a SUCCESSFUL
+        // send, so a failed push leaves the old anchor in place and the next
+        // run still measures against the last price actually delivered.
+        price_per_gallon: decision.best?.price_per_gallon ?? null,
+        reason: trigger.reason,
       };
     },
   );

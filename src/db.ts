@@ -285,6 +285,17 @@ export interface NotifiedRow {
   subscription_id: number;
   fingerprint: string;
   sent_at: string;
+  /** The price actually quoted. This is the sticky anchor future runs compare against. */
+  price_per_gallon: number | null;
+  /** Which trigger fired, so "why did I get this?" stays answerable. */
+  reason: string;
+}
+
+/** The last notification sent for one subscription, whenever that was. */
+export interface LastNotification {
+  scrape_date: string;
+  price_per_gallon: number | null;
+  fingerprint: string;
 }
 
 /**
@@ -328,11 +339,11 @@ export async function getNotifiedFingerprints(
 }
 
 /**
- * Max `notifications` rows per multi-row INSERT. A row binds 4 columns, so 24
- * rows = 96 bound parameters against D1's 100-parameter cap. Kept conservative
- * for the same reason as `ROWS_PER_INSERT`.
+ * Max `notifications` rows per multi-row INSERT. A row now binds 6 columns, so
+ * 16 rows = 96 bound parameters against D1's 100-parameter cap. Kept
+ * conservative for the same reason as `ROWS_PER_INSERT`.
  */
-const NOTIFIED_ROWS_PER_INSERT = 24;
+const NOTIFIED_ROWS_PER_INSERT = 16;
 
 /**
  * Records every send of one run in a single `db.batch()`, so the write cost does
@@ -355,22 +366,136 @@ export async function recordNotifiedBatch(
   const statements: D1PreparedStatement[] = [];
   for (let i = 0; i < rows.length; i += NOTIFIED_ROWS_PER_INSERT) {
     const chunk = rows.slice(i, i + NOTIFIED_ROWS_PER_INSERT);
-    const values = chunk.map(() => "(?,?,?,?)").join(", ");
+    const values = chunk.map(() => "(?,?,?,?,?,?)").join(", ");
     const params: unknown[] = [];
     for (const row of chunk) {
-      params.push(row.scrape_date, row.subscription_id, row.fingerprint, row.sent_at);
+      params.push(
+        row.scrape_date,
+        row.subscription_id,
+        row.fingerprint,
+        row.sent_at,
+        row.price_per_gallon,
+        row.reason,
+      );
     }
     statements.push(
       db
         .prepare(
-          "INSERT INTO notifications (scrape_date, subscription_id, fingerprint, sent_at) " +
+          "INSERT INTO notifications " +
+            "(scrape_date, subscription_id, fingerprint, sent_at, price_per_gallon, reason) " +
             `VALUES ${values} ` +
             "ON CONFLICT (scrape_date, subscription_id) DO UPDATE SET " +
-            "fingerprint = excluded.fingerprint, sent_at = excluded.sent_at",
+            "fingerprint = excluded.fingerprint, sent_at = excluded.sent_at, " +
+            "price_per_gallon = excluded.price_per_gallon, reason = excluded.reason",
         )
         .bind(...params),
     );
   }
 
   await db.batch(statements);
+}
+
+/**
+ * The most recent notification for each subscription, whatever day it was sent.
+ *
+ * This is the STICKY ANCHOR that makes slow price drift detectable. Comparing
+ * against yesterday resets the baseline daily, so five consecutive 1-cent moves
+ * in one direction are five non-events; comparing against the last price we
+ * actually reported means those five cents accumulate and eventually trip.
+ *
+ * One query for all subscriptions, so the cost does not grow per subscription.
+ */
+export async function getLastNotifications(
+  db: D1Database,
+  subscriptionIds: number[],
+): Promise<Map<number, LastNotification>> {
+  const out = new Map<number, LastNotification>();
+  if (subscriptionIds.length === 0) return out;
+
+  const placeholders = subscriptionIds.map(() => "?").join(",");
+  const result = await db
+    .prepare(
+      "SELECT n.subscription_id, n.scrape_date, n.price_per_gallon, n.fingerprint " +
+        "FROM notifications n " +
+        "JOIN (SELECT subscription_id, MAX(scrape_date) AS scrape_date FROM notifications " +
+        `      WHERE subscription_id IN (${placeholders}) GROUP BY subscription_id) latest ` +
+        "  ON latest.subscription_id = n.subscription_id " +
+        " AND latest.scrape_date = n.scrape_date",
+    )
+    .bind(...subscriptionIds)
+    .all<{
+      subscription_id: number;
+      scrape_date: string;
+      price_per_gallon: number | null;
+      fingerprint: string;
+    }>();
+
+  for (const row of result.results ?? []) {
+    out.set(row.subscription_id, {
+      scrape_date: row.scrape_date,
+      price_per_gallon: row.price_per_gallon,
+      fingerprint: row.fingerprint,
+    });
+  }
+  return out;
+}
+
+/** One historical tier low, as stored. */
+export interface TierLow {
+  payment_type: string;
+  gallon_min: number;
+  gallon_max: number | null;
+  low: number;
+}
+
+/**
+ * Cheapest price ever recorded for each tier of a zip, EXCLUDING the day being
+ * processed.
+ *
+ * ONE query regardless of how many subscriptions exist. An earlier version took
+ * the tier predicate into SQL and ran per subscription, which reintroduced the
+ * `8 + 2S` query scaling that D1's 50-query per-invocation cap makes unsafe —
+ * ten subscriptions took the invocation from 10 statements to 21. Grouping here
+ * and selecting the matching tiers in JS keeps the cost flat.
+ *
+ * Returns [] when there is no prior history, which is the normal state for the
+ * first days of tracking.
+ */
+export async function getTierLows(
+  db: D1Database,
+  zip: string,
+  beforeScrapeDate: string,
+): Promise<TierLow[]> {
+  const result = await db
+    .prepare(
+      "SELECT payment_type, gallon_min, gallon_max, MIN(price_per_gallon) AS low " +
+        "FROM prices WHERE zip = ? AND scrape_date < ? " +
+        "GROUP BY payment_type, gallon_min, gallon_max",
+    )
+    .bind(zip, beforeScrapeDate)
+    .all<TierLow>();
+  return result.results ?? [];
+}
+
+/**
+ * Lowest price ever recorded for the tier a given order size falls into.
+ *
+ * The predicate mirrors `selectBestPrice` exactly: a subscriber wanting
+ * `minGallons` can only buy at a tier that covers that quantity. Comparing
+ * against the zip's whole history regardless of tier would measure a
+ * 150-gallon price against a 300-gallon one and call it a new low.
+ */
+export function tierLowFor(
+  lows: TierLow[],
+  paymentType: string,
+  minGallons: number,
+): number | null {
+  let best: number | null = null;
+  for (const row of lows) {
+    if (row.payment_type !== paymentType) continue;
+    if (minGallons < row.gallon_min) continue;
+    if (row.gallon_max !== null && minGallons > row.gallon_max) continue;
+    if (best === null || row.low < best) best = row.low;
+  }
+  return best;
 }

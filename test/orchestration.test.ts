@@ -362,22 +362,24 @@ describe("processZip — end to end against the real fixture", () => {
     expect(stub.siteCalls()[0]?.url).toBe(SLUG_URL);
 
     // 1 getZip + 1 DELETE + 5 INSERT + 1 subscription read
-    // + 1 getNotifiedFingerprints + 1 recordNotifiedBatch = 10.
+    // + 1 getNotifiedFingerprints + 1 getLastNotifications + 1 getTierLows
+    // + 1 recordNotifiedBatch = 12.
     //
-    // The dedupe pair no longer scales with the subscription count: it was
-    // 2 statements PER subscription (12 here, and past D1's 50-query cap at
-    // ~21 subscriptions), and is now 2 statements in total.
+    // NONE of these scale with the subscription count. Every read that once ran
+    // per subscription — the dedupe pair, and later the historical-low lookup —
+    // was batched precisely because per-subscription reads breach D1's 50-query
+    // per-invocation cap at a low subscription count.
     const observed = counter.prepares();
     console.log(`[query guard] cached-slug happy path issued ${observed} D1 statements`);
-    expect(observed).toBe(10);
+    expect(observed).toBe(12);
     expect(observed).toBeLessThanOrEqual(14);
   });
 
-  it("the dedupe cost does not grow with the subscription count", async () => {
+  it("the per-invocation query cost does not grow with the subscription count", async () => {
     await seed(SLUG);
-    // Eight more subscriptions on the same zip. Under the old one-wasNotified-
-    // and-one-recordNotified-per-subscription shape this would have cost 20
-    // dedupe statements; it now costs 2, so the total is unchanged at 10.
+    // Eight more subscriptions on the same zip. Per-subscription reads would
+    // cost 10 dedupe + 10 historical-low statements here and breach D1's
+    // 50-query cap at ~20 subscriptions; batched, the total stays at 12.
     await baseEnv.DB.batch(
       Array.from({ length: 8 }, (_, i) =>
         // `user_id` varies: subscriptions carry a UNIQUE
@@ -396,7 +398,7 @@ describe("processZip — end to end against the real fixture", () => {
     const result = await processZip(message(), env, stub.impl);
 
     expect(result.notifications_sent).toBe(10);
-    expect(counter.prepares()).toBe(10);
+    expect(counter.prepares()).toBe(12);
     expect(counter.prepares()).toBeLessThanOrEqual(14);
   });
 });

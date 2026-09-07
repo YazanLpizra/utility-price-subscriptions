@@ -201,6 +201,7 @@ export function buildNotification(
   decision: NotificationDecision,
   zip: string,
   scrapeDate: string,
+  trigger?: TriggerDecision,
 ): NotificationMessage {
   const { best, stale } = decision;
   const sub = decision.subscription;
@@ -227,8 +228,17 @@ export function buildNotification(
   const price = best.price_per_gallon.toFixed(2);
   const tier = formatTier(best.gallon_min, best.gallon_max);
 
+  // The movement belongs in the TITLE: a push notification is often read as one
+  // line on a lock screen, and "$4.80/gal (down 0.07)" answers the question the
+  // subscriber actually has without opening anything.
+  const move =
+    trigger?.delta == null || trigger.delta === 0
+      ? ""
+      : ` (${trigger.delta > 0 ? "up" : "down"} ${Math.abs(trigger.delta).toFixed(2)})`;
+  const lowFlag = trigger?.isNewLow === true ? " — lowest yet" : "";
+
   const title =
-    `${stale ? "[STALE] " : ""}$${price}/gal ${best.payment_type} in ${zip}`;
+    `${stale ? "[STALE] " : ""}$${price}/gal ${best.payment_type} in ${zip}${move}${lowFlag}`;
 
   const lines = [
     `$${price} per gallon (${best.payment_type})`,
@@ -239,6 +249,10 @@ export function buildNotification(
     `Scrape date: ${scrapeDate}`,
     `Zip: ${zip}`,
   ];
+
+  if (trigger !== undefined) {
+    lines.push("", triggerSummary(trigger));
+  }
 
   if (stale) {
     lines.push(
@@ -375,6 +389,154 @@ async function postToTelegram(
       `[telegram] send threw: ${err instanceof Error ? err.name : typeof err}`,
     );
     return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// When is a notification worth sending?
+// ---------------------------------------------------------------------------
+
+/**
+ * Why a notification was sent, or why it was withheld.
+ *
+ * Stored alongside the notification so "why did I get this?" stays answerable,
+ * and so the triggers can be tuned against real history later rather than
+ * guessed at again.
+ */
+export type TriggerReason =
+  | "first_ever"
+  | "price_moved"
+  | "new_low"
+  | "periodic_digest"
+  | "unchanged";
+
+export interface TriggerContext {
+  /** Price we last reported to this subscriber — the sticky anchor. */
+  lastNotifiedPrice: number | null;
+  /** ISO date of that last report, for the digest clock. */
+  lastNotifiedDate: string | null;
+  /** Cheapest price ever recorded for this zip and tier BEFORE today. */
+  historicalMinPrice: number | null;
+  /** Dollars per gallon of movement that counts as worth a push. */
+  minDelta: number;
+  /** Send an unconditional digest when the last send is at least this old. */
+  digestAfterDays: number;
+}
+
+export interface TriggerDecision {
+  send: boolean;
+  reason: TriggerReason;
+  /** Signed movement against the anchor: positive is a rise. */
+  delta: number | null;
+  /** True when today beats every price previously recorded for this tier. */
+  isNewLow: boolean;
+  daysSinceLast: number | null;
+}
+
+/**
+ * Decides whether today's price is worth interrupting someone for.
+ *
+ * Pure: every input arrives as an argument, so the policy is testable without a
+ * database. The caller supplies the history.
+ *
+ * THE DESIGN PROBLEM. A message every day is noise, and noise gets ignored. But
+ * the two obvious alternatives are both broken:
+ *
+ *   * A fixed price threshold requires guessing a number before anyone has seen
+ *     a season of data.
+ *   * A per-day delta resets its baseline every day, so a slow grind in one
+ *     direction never trips: five consecutive 1-cent moves are five
+ *     non-events even though the price has moved 5 cents.
+ *
+ * So the comparison is against the price we LAST REPORTED, not against
+ * yesterday. That anchor only moves when a notification is actually sent, so
+ * drift accumulates against it and eventually crosses `minDelta`.
+ *
+ * Three things earn a push:
+ *   1. `price_moved`      — |today - anchor| >= minDelta, either direction. A
+ *                           rise matters as much as a fall to someone who has
+ *                           to buy soon: waiting is then a pure loss.
+ *   2. `new_low`          — cheapest ever recorded for this tier. The actual
+ *                           buy signal, and self-calibrating: no number to pick.
+ *   3. `periodic_digest`  — nothing has happened for `digestAfterDays`. Not a
+ *                           price signal at all; it exists so that silence is
+ *                           never ambiguous. Without it, "no messages for three
+ *                           weeks" and "the scraper broke" look identical.
+ */
+export function shouldNotify(
+  decision: NotificationDecision,
+  ctx: TriggerContext,
+  scrapeDate: string,
+): TriggerDecision {
+  // Nothing qualifying to report, or already suppressed upstream.
+  if (!decision.should_send || decision.best === null) {
+    return {
+      send: false,
+      reason: "unchanged",
+      delta: null,
+      isNewLow: false,
+      daysSinceLast: null,
+    };
+  }
+
+  const price = decision.best.price_per_gallon;
+  const anchor = ctx.lastNotifiedPrice;
+  const daysSinceLast =
+    ctx.lastNotifiedDate === null ? null : daysBetween(ctx.lastNotifiedDate, scrapeDate);
+
+  const isNewLow =
+    ctx.historicalMinPrice === null ? false : price < ctx.historicalMinPrice - 1e-9;
+
+  // Never reported to this subscriber before: they get the current price once,
+  // which also sets the anchor everything later is measured against.
+  if (anchor === null) {
+    return { send: true, reason: "first_ever", delta: null, isNewLow, daysSinceLast };
+  }
+
+  const delta = round2(price - anchor);
+
+  if (Math.abs(delta) + 1e-9 >= ctx.minDelta) {
+    return { send: true, reason: "price_moved", delta, isNewLow, daysSinceLast };
+  }
+
+  if (isNewLow) {
+    return { send: true, reason: "new_low", delta, isNewLow, daysSinceLast };
+  }
+
+  if (daysSinceLast !== null && daysSinceLast >= ctx.digestAfterDays) {
+    return { send: true, reason: "periodic_digest", delta, isNewLow, daysSinceLast };
+  }
+
+  return { send: false, reason: "unchanged", delta, isNewLow, daysSinceLast };
+}
+
+/** Money rounded to cents, so 4.9 - 4.8 is 0.10 and not 0.10000000000000053. */
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+/** One human sentence explaining why this message arrived. */
+export function triggerSummary(t: TriggerDecision): string {
+  const move =
+    t.delta === null || t.delta === 0
+      ? null
+      : `${t.delta > 0 ? "up" : "down"} ${Math.abs(t.delta).toFixed(2)}/gal since I last told you`;
+
+  switch (t.reason) {
+    case "first_ever":
+      return "First reading — I will only message you from now on when this moves.";
+    case "price_moved":
+      return t.isNewLow
+        ? `${move} — and it is the lowest I have recorded for this quantity.`
+        : `${move}.`;
+    case "new_low":
+      return "Lowest price I have recorded for this quantity.";
+    case "periodic_digest":
+      return move === null
+        ? "Periodic check-in: the price has not moved meaningfully."
+        : `Periodic check-in: ${move}.`;
+    case "unchanged":
+      return "No meaningful change.";
   }
 }
 

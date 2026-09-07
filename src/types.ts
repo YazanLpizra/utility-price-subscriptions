@@ -137,6 +137,19 @@ export interface Env {
   /** stringified integer N; notification annotated stale when data is older than N days. */
   STALE_AFTER_DAYS: string;
   /**
+   * Dollars per gallon of movement worth a push. Defaults to 0.05 — at a
+   * ~150-gallon fill that is about $8, roughly the floor of "worth knowing".
+   * Compared against the price LAST REPORTED, not against yesterday, so a slow
+   * drift in one direction still accumulates until it trips.
+   */
+  NOTIFY_MIN_DELTA?: string;
+  /**
+   * Days of silence after which a check-in is sent even though nothing moved.
+   * Defaults to 7. Exists so that "no messages" is never ambiguous between a
+   * flat market and a broken scraper.
+   */
+  NOTIFY_DIGEST_DAYS?: string;
+  /**
    * TEMPORARY. "0" disables notification de-duplication, so every run pushes.
    * Used to observe a short-interval cron from the phone. Absent or any other
    * value means dedupe is on, which is the intended production behaviour.
