@@ -4,11 +4,14 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-09-01",
   "observability": { "enabled": true },
+  // No fetch handler: this Worker is cron + queue only, so it publishes no
+  // HTTP endpoint. Leaving these unset makes wrangler enable both by default.
+  "workers_dev": false,
+  "preview_urls": false,
   "triggers": { "crons": ["0 12 * * *"] },
   "vars": {
     "SITE_BASE_URL": "https://www.cashheatingoil.com",
     "NTFY_BASE_URL": "https://ntfy.sh",
-    "NTFY_ALERT_TOPIC": "heating-oil-alerts-placeholder",
     "STALE_AFTER_DAYS": "3",
     "USER_AGENT": "heating-oil-tracker/1.0 (+personal price tracker)"
   },
@@ -16,7 +19,7 @@
     {
       "binding": "DB",
       "database_name": "heating-oil",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "d564bce0-ff05-4987-8bb1-95897e8ba9f9",
       "migrations_dir": "migrations"
     }
   ],

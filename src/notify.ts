@@ -308,13 +308,25 @@ async function postToNtfy(
     // would need encoding: correct by construction, not by the validator
     // happening to stay strict.
     const url = `${env.NTFY_BASE_URL}/${encodeURIComponent(topic)}`;
+    const headers: Record<string, string> = {
+      Title: msg.title,
+      Tags: msg.tags.join(","),
+      Priority: String(msg.priority),
+    };
+    // Authenticate when a token is configured. ntfy meters anonymous publishing
+    // per source IP; Workers share egress IPs, so unauthenticated pushes from
+    // production get 429 "daily message quota reached" regardless of our own
+    // volume. The token moves metering to the owning account. It is a secret:
+    // never log it, and never put it in wrangler.jsonc vars.
+    // Trimmed: `wrangler secret put` reads stdin, and piping a value through a
+    // shell very easily stores a trailing newline. An untrimmed token produces
+    // a malformed header and a 401 that looks exactly like a bad credential —
+    // which cost a diagnosis cycle here.
+    const token = env.NTFY_TOKEN?.trim();
+    if (token) headers["Authorization"] = `Bearer ${token}`;
     const res = await fetchImpl(url, {
       method: "POST",
-      headers: {
-        Title: msg.title,
-        Tags: msg.tags.join(","),
-        Priority: String(msg.priority),
-      },
+      headers,
       body: msg.body,
       // A stalled ntfy connection would otherwise hold a queue invocation open
       // against its 15-minute ceiling. `src/fetcher.ts` already bounds the site
@@ -323,11 +335,29 @@ async function postToNtfy(
       // `false` — the never-throw guarantee is unchanged.
       signal: AbortSignal.timeout(10_000),
     });
-    return res.status >= 200 && res.status < 300;
-  } catch {
+    if (res.status >= 200 && res.status < 300) return true;
+    // Log WHY. Without this a failed push is indistinguishable from a
+    // suppressed one, which cost real time to diagnose in production. The
+    // status and a short body excerpt are enough to tell a rate limit from a
+    // rejected payload; the topic is never logged, because on unauthenticated
+    // ntfy it is the credential.
+    let excerpt = "";
+    try {
+      excerpt = (await res.text()).slice(0, 200);
+    } catch {
+      excerpt = "<unreadable body>";
+    }
+    console.error(
+      `[ntfy] push rejected: status=${res.status} ${res.statusText} body=${excerpt}`,
+    );
+    return false;
+  } catch (err) {
     // PRD §8: a failed push must not lose data that is already written, so a
     // transport failure — timeout included — is a `false`, never an exception.
     // The topic is never logged: on unauthenticated ntfy it is the credential.
+    console.error(
+      `[ntfy] push threw: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`,
+    );
     return false;
   }
 }

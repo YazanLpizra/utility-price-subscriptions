@@ -132,5 +132,19 @@ export interface Env {
   NTFY_ALERT_TOPIC: string;
   /** stringified integer N; notification annotated stale when data is older than N days. */
   STALE_AFTER_DAYS: string;
+  /**
+   * TEMPORARY. "0" disables notification de-duplication, so every run pushes.
+   * Used to observe a short-interval cron from the phone. Absent or any other
+   * value means dedupe is on, which is the intended production behaviour.
+   */
+  NOTIFY_DEDUPE?: string;
+  /**
+   * ntfy access token, supplied as a Cloudflare SECRET — never a var, and never
+   * committed. Without it ntfy meters anonymous publishing per source IP, and
+   * Workers egress from shared IPs whose daily quota is routinely already spent
+   * by other tenants; production pushes came back 429 until this was added.
+   * With it, metering moves to the account that owns the token.
+   */
+  NTFY_TOKEN?: string;
   USER_AGENT: string;
 }

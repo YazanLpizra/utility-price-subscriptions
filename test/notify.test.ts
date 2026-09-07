@@ -547,3 +547,62 @@ describe("sendAlert", () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+// --------------------------------------------------------------- ntfy auth
+
+describe("ntfy authentication", () => {
+  const msg = { title: "t", body: "b", tags: ["fuelpump"], priority: 3 };
+
+  it("sends no Authorization header when no token is configured", async () => {
+    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
+    expect(await sendNtfy(env, "my-topic", msg, impl)).toBe(true);
+    const headers = calls[0]!.init?.headers as Record<string, string>;
+    expect(headers["Authorization"]).toBeUndefined();
+  });
+
+  it("sends a Bearer token when NTFY_TOKEN is set", async () => {
+    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
+    const authed: Env = { ...env, NTFY_TOKEN: "tk_example" };
+    expect(await sendNtfy(authed, "my-topic", msg, impl)).toBe(true);
+    const headers = calls[0]!.init?.headers as Record<string, string>;
+    expect(headers["Authorization"]).toBe("Bearer tk_example");
+  });
+
+  it("authenticates alerts too, not just subscriber pushes", async () => {
+    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
+    const authed: Env = { ...env, NTFY_TOKEN: "tk_example" };
+    expect(await sendAlert(authed, "t", "b", impl)).toBe(true);
+    const headers = calls[0]!.init?.headers as Record<string, string>;
+    expect(headers["Authorization"]).toBe("Bearer tk_example");
+  });
+
+  it("never puts the token in the URL, where it could be logged", async () => {
+    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
+    const authed: Env = { ...env, NTFY_TOKEN: "tk_example" };
+    await sendNtfy(authed, "my-topic", msg, impl);
+    expect(calls[0]!.url).toBe("https://ntfy.sh/my-topic");
+    expect(calls[0]!.url).not.toContain("tk_example");
+  });
+
+  it("still returns false, without throwing, when an authenticated push is rejected", async () => {
+    const { impl } = stubFetch(() => new Response("denied", { status: 401 }));
+    const authed: Env = { ...env, NTFY_TOKEN: "tk_example" };
+    expect(await sendNtfy(authed, "my-topic", msg, impl)).toBe(false);
+  });
+
+  it("trims a token stored with a trailing newline by `wrangler secret put`", async () => {
+    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
+    const authed: Env = { ...env, NTFY_TOKEN: "tk_example\r\n" };
+    expect(await sendNtfy(authed, "my-topic", msg, impl)).toBe(true);
+    const headers = calls[0]!.init?.headers as Record<string, string>;
+    expect(headers["Authorization"]).toBe("Bearer tk_example");
+  });
+
+  it("treats a whitespace-only token as absent", async () => {
+    const { impl, calls } = stubFetch(() => new Response("ok", { status: 200 }));
+    const authed: Env = { ...env, NTFY_TOKEN: "   " };
+    expect(await sendNtfy(authed, "my-topic", msg, impl)).toBe(true);
+    const headers = calls[0]!.init?.headers as Record<string, string>;
+    expect(headers["Authorization"]).toBeUndefined();
+  });
+});

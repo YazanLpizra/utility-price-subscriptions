@@ -7,7 +7,20 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
-      miniflare: { bindings: { TEST_MIGRATIONS: migrations } },
+      miniflare: {
+        bindings: {
+          TEST_MIGRATIONS: migrations,
+          // NTFY_ALERT_TOPIC is deliberately NOT a var in wrangler.jsonc: a
+          // plain var there shares the binding namespace with secrets and
+          // overwrites `wrangler secret put` on every deploy. In production it
+          // is a secret; here it is a test-only binding.
+          NTFY_ALERT_TOPIC: "test-alert-topic",
+          // Tests always exercise the PRODUCTION dedupe behaviour, regardless
+          // of the temporary NOTIFY_DEDUPE="0" diagnostic flag in
+          // wrangler.jsonc, whose vars this config otherwise inherits.
+          NOTIFY_DEDUPE: "1",
+        },
+      },
     }),
   ],
   test: {

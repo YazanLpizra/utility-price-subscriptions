@@ -366,16 +366,28 @@ export async function processZip(
   // fingerprint DIFFERS means the price genuinely changed since that send, so
   // send again; suppressing it would silently drop a real price movement on a
   // same-day re-run, which is the whole reason the fingerprint is stored.
-  const alreadySent = await getNotifiedFingerprints(
-    env.DB,
-    scrapeDate,
-    sendable.map((candidate) => candidate.sub.id),
-  );
+  // TEMPORARY DIAGNOSTIC ESCAPE HATCH. Setting NOTIFY_DEDUPE="0" makes every
+  // run notify, so a short-interval cron can be observed firing from the phone
+  // rather than only from the database. Off means one push per run per
+  // subscription — at a 5-minute cron that is ~288 pushes a day. Restore this
+  // to "1" (or drop the var, which is the same thing) once the schedule is
+  // confirmed working.
+  const dedupeEnabled = env.NOTIFY_DEDUPE !== "0";
 
-  const pending = sendable.filter(({ sub, decision }) => {
-    const recorded = alreadySent.get(sub.id);
-    return recorded === undefined || recorded !== notificationFingerprint(decision);
-  });
+  const alreadySent = dedupeEnabled
+    ? await getNotifiedFingerprints(
+        env.DB,
+        scrapeDate,
+        sendable.map((candidate) => candidate.sub.id),
+      )
+    : new Map<number, string>();
+
+  const pending = dedupeEnabled
+    ? sendable.filter(({ sub, decision }) => {
+        const recorded = alreadySent.get(sub.id);
+        return recorded === undefined || recorded !== notificationFingerprint(decision);
+      })
+    : sendable;
 
   // 9. notify, bounded at 6 concurrent outbound requests (PRD §9.1).
   const settled = await mapWithConcurrency(
@@ -427,7 +439,10 @@ export async function processZip(
   // failed. A failure here joins the aggregate below rather than escaping on
   // its own, so the reporting has a single shape.
   try {
-    await recordNotifiedBatch(env.DB, recordRows);
+    // Skipped entirely when dedupe is off: with nothing reading the table,
+    // writing it would only add D1 work and leave rows that would suppress
+    // sends the moment dedupe is switched back on mid-day.
+    if (dedupeEnabled) await recordNotifiedBatch(env.DB, recordRows);
   } catch (recordErr) {
     failures.push(recordErr);
     console.error(

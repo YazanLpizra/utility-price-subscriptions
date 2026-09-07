@@ -31,7 +31,10 @@ import type { Env, ScrapeMessage } from "../src/types";
 
 const BASE = "https://www.cashheatingoil.com";
 const NTFY = "https://ntfy.sh";
-const ALERT_TOPIC = "heating-oil-alerts-placeholder";
+// Read from the binding rather than hardcoded: NTFY_ALERT_TOPIC is not a var
+// in wrangler.jsonc (a var there would overwrite the production secret on
+// every deploy), so it is supplied as a test-only binding in vitest.config.ts.
+const ALERT_TOPIC = testEnv.NTFY_ALERT_TOPIC;
 const SUB_TOPIC = "heating-oil-local-dev";
 const ZIP = "06483";
 const SLUG = "seymour_ct_oil_prices/06483";
