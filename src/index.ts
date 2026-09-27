@@ -23,6 +23,9 @@
  *                           one. NOTE: the slug resolved for this page IS still
  *                           persisted — the page was structurally valid, so the
  *                           URL is worth caching (see processZip's docblock).
+ *   unreadable listing   -> skipped inside the parser and logged as
+ *                           PARSE_SKIP_LISTING (with its raw HTML); the rest of
+ *                           the page is written as normal. No alert.
  *   ParseError           -> markup drift. processZip rethrows; queue() alerts
  *                           and ACKs — a retry cannot fix markup. Same slug
  *                           caveat: no PRICE rows, but the slug may be written.
@@ -344,8 +347,10 @@ export async function processZip(
     );
   }
 
-  // 4. parse. A ParseError propagates unchanged — queue() acks it.
-  const listings = await parseListingsPage(page.html);
+  // 4. parse. Unreadable listings are skipped and logged (PARSE_SKIP_LISTING);
+  // a ParseError means nothing on the page was readable and propagates
+  // unchanged — queue() acks it.
+  const listings = await parseListingsPage(page.html, { zip });
 
   // Zero listings: a valid page with nothing on it. Write nothing, notify
   // nobody (PRD §8 — a missing day beats a wrong one). `stale` is false, not

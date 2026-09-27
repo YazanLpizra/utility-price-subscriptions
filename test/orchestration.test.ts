@@ -56,9 +56,12 @@ const baseEnv = testEnv as unknown as Env;
 /** A structurally valid page carrying zero `div.boxlisting` elements. */
 const strippedFixture = fixture.replace(/boxlisting/g, "nolisting");
 
-/** Markup drift: an enumtype the parser refuses to guess at -> ParseError. */
+/**
+ * Site-wide markup drift: an enumtype the parser refuses to guess at, in EVERY
+ * listing -> ParseError. (One bad listing is merely skipped; see parser tests.)
+ */
 const brokenFixture = fixture.replace(
-  'name="enumtype" value="Cash"',
+  /name="enumtype" value="Cash"/g,
   'name="enumtype" value="Debit"',
 );
 

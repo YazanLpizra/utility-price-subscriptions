@@ -8,7 +8,7 @@
  * tests are what notice.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fixture from "./fixtures/06483.html?raw";
 import liveFixture from "./fixtures/06483-2026-09-07.html?raw";
 import {
@@ -349,7 +349,7 @@ describe("defensive rules", () => {
     await expect(parseListingsPage(broken)).rejects.toBeInstanceOf(ParseError);
   });
 
-  it("rejects a listing whose two dealerid values disagree", async () => {
+  it("skips a listing whose two dealerid values disagree, keeping the rest", async () => {
     // Change only the SECOND occurrence of dealer 11's id.
     let seen = 0;
     const broken = fixture.replace(/name="dealerid" value="11"/g, (m) => {
@@ -357,17 +357,96 @@ describe("defensive rules", () => {
       return seen === 2 ? 'name="dealerid" value="99"' : m;
     });
     expect(seen).toBeGreaterThanOrEqual(2);
-    await expect(parseListingsPage(broken)).rejects.toBeInstanceOf(ParseError);
+    const listings = await parseListingsPage(broken);
+    expect(listings.map((l) => l.dealer_id)).toEqual([372, 744, 345, 919]);
   });
 
-  it("rejects a listing whose enumtype no longer matches its table class", async () => {
+  it("skips a listing whose enumtype no longer matches its table class", async () => {
     const broken = fixture.replace('value="Credit"', 'value="Cash"');
+    const listings = await parseListingsPage(broken);
+    expect(listings.map((l) => l.dealer_id)).toEqual([372, 744, 345, 919]);
+  });
+
+  it("still rejects a page on which NO listing can be parsed", async () => {
+    const broken = fixture.replace(/name="dealerid"/g, 'name="notdealerid"');
     await expect(parseListingsPage(broken)).rejects.toBeInstanceOf(ParseError);
   });
 
   it("names the offending listing index in the error message", async () => {
     const broken = fixture.replace(/name="dealerid"/g, 'name="notdealerid"');
     await expect(parseListingsPage(broken)).rejects.toThrow(/listing index \d+/i);
+  });
+});
+
+// --------------------------------------------------------------- best effort
+
+/** Applies `edit` to the first listing (dealer 11) only, leaving the rest intact. */
+function editFirstListing(edit: (html: string) => string): string {
+  const second = fixture.indexOf("boxlisting", fixture.indexOf("boxlisting") + 1);
+  return edit(fixture.slice(0, second)) + fixture.slice(second);
+}
+
+describe("best-effort parsing", () => {
+  it("skips a listing with no price tiers instead of failing the page", async () => {
+    // The production error: "listing index 0: no price tiers found".
+    const noTiers = editFirstListing((h) =>
+      h.replace(/<td>\d+-\d+<\/td>\s*<td>\$[\d.]+<\/td>/g, ""),
+    );
+    const listings = await parseListingsPage(noTiers);
+    expect(listings.map((l) => l.dealer_id)).toEqual([372, 744, 345, 919]);
+    expect(listings.reduce((n, l) => n + l.tiers.length, 0)).toBe(EXPECTED_TOTAL - 8);
+  });
+
+  it("logs a skipped listing with its raw HTML, for tuning the parser later", async () => {
+    const noTiers = editFirstListing((h) =>
+      h.replace(/<td>\d+-\d+<\/td>\s*<td>\$[\d.]+<\/td>/g, ""),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await parseListingsPage(noTiers, { zip: "06483" });
+      const lines = warn.mock.calls
+        .map((c) => String(c[0]))
+        .filter((l) => l.startsWith("PARSE_SKIP_LISTING "));
+      expect(lines).toHaveLength(1);
+      const entry = JSON.parse(lines[0]!.slice("PARSE_SKIP_LISTING ".length));
+      expect(entry.zip).toBe("06483");
+      expect(entry.listing_index).toBe(0);
+      expect(entry.reason).toMatch(/no price tiers found/);
+      expect(entry.forms.map((f: { dealerids: string[] }) => f.dealerids)).toEqual([
+        ["11"],
+        ["11"],
+      ]);
+      // Exactly this listing's markup: it starts at its own div and stops
+      // before the next dealer's.
+      expect(entry.html).toMatch(/^<div class="boxlisting">/);
+      expect(entry.html).toContain('value="11"');
+      expect(entry.html).not.toContain('value="372"');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("drops only the tier whose price is unreadable", async () => {
+    const callForPrice = editFirstListing((h) =>
+      h.replace("<td>$4.84</td>", "<td>Call</td>"),
+    );
+    const dealer11 = (await parseListingsPage(callForPrice)).find((l) => l.dealer_id === 11)!;
+    expect(tiersOf(dealer11, "cash")).toEqual(GROUND_TRUTH[0]!.cash.slice(1));
+    expect(tiersOf(dealer11, "credit")).toEqual(GROUND_TRUTH[0]!.credit);
+  });
+
+  it("reads loosely formatted gallons and prices", async () => {
+    const loose = editFirstListing((h) =>
+      h
+        .replace("<td>100-149</td>", "<td>100 – 149 gal</td>")
+        .replace("<td>$4.84</td>", "<td>4.849/gal</td>")
+        .replace("<td>150-199</td>", "<td>150-199 Gallons</td>"),
+    );
+    const dealer11 = (await parseListingsPage(loose)).find((l) => l.dealer_id === 11)!;
+    expect(tiersOf(dealer11, "cash")).toEqual([
+      [100, 149, 4.849],
+      ...GROUND_TRUTH[0]!.cash.slice(1),
+    ]);
   });
 });
 
@@ -451,29 +530,42 @@ describe("adversarial markup", () => {
     expect(listings.reduce((n, l) => n + l.tiers.length, 0)).toBe(EXPECTED_TOTAL);
   });
 
-  it("rejects a <td> with no closing tag rather than truncating the table", async () => {
+  it("drops a table with an unclosed <td> whole, rather than truncating it", async () => {
     const injected = fixture.replace("<td>200-299</td>", "<td>200-299");
-    await expect(parseListingsPage(injected)).rejects.toBeInstanceOf(ParseError);
+    const listings = await parseListingsPage(injected);
+    const dealer11 = listings.find((l) => l.dealer_id === 11)!;
+    // No partial cash table survives; the untouched credit side does.
+    expect(tiersOf(dealer11, "cash")).toEqual([]);
+    expect(tiersOf(dealer11, "credit")).toEqual(GROUND_TRUTH[0]!.credit);
+    expect(listings.length).toBe(5);
   });
 
-  it("rejects a price table containing a nested table", async () => {
+  it("drops a price table containing a nested table, keeping the page", async () => {
     const injected = fixture.replace(
       "<td>100-149</td>",
       "<td><table><tr><td>x</td></tr></table></td>",
     );
-    await expect(parseListingsPage(injected)).rejects.toBeInstanceOf(ParseError);
+    const listings = await parseListingsPage(injected);
+    expect(tiersOf(listings.find((l) => l.dealer_id === 11)!, "cash")).toEqual([]);
+    expect(listings.length).toBe(5);
   });
 
-  it("rejects a page whose dealerids disagree between the two passes", async () => {
-    // Change the dealerid only where the SCAN reads it (inside the form), so the
-    // scan and HTMLRewriter end up disagreeing about who owns these prices.
+  it("never files one dealer's prices under another when a dealerid drifts", async () => {
+    // Break dealer 372's first form only. Its listing must be skipped — and,
+    // crucially, no later dealer may inherit a shifted set of prices.
     let seen = 0;
     const injected = fixture.replace(/value="372"/g, (m) => {
       seen++;
       return seen === 1 ? 'value="99999"' : m;
     });
     expect(seen).toBeGreaterThan(0);
-    await expect(parseListingsPage(injected)).rejects.toThrow(/dealerid|disagree/i);
+    const listings = await parseListingsPage(injected);
+    expect(listings.map((l) => l.dealer_id)).toEqual([11, 744, 345, 919]);
+    for (const expected of GROUND_TRUTH.filter((d) => d.dealer_id !== 372)) {
+      const listing = listings.find((l) => l.dealer_id === expected.dealer_id)!;
+      expect(tiersOf(listing, "cash")).toEqual(expected.cash);
+      expect(tiersOf(listing, "credit")).toEqual(expected.credit);
+    }
   });
 
   it("scans pathological input in linear time", () => {

@@ -96,9 +96,13 @@ function norm(input: string): string {
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const HUMAN_DATE = /^([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?\s+(\d{4})$/i;
-const GALLONS_RANGE = /^(\d+)\s*-\s*(\d+)\s*\+?$/;
-const GALLONS_OPEN = /^(\d+)\s*\+$/;
-const PRICE_CELL = /^\$\s*([\d,]+\.\d{2})$/;
+// Tier cells are matched leniently — a dealer's hand-edited table may use an en
+// dash, a "gal"/"gallons" suffix, a price without "$", or a third decimal. A
+// cell that still does not match is skipped, not fatal (see tiersFromForm).
+const GAL_SUFFIX = String.raw`(?:\s*gal(?:lon)?s?\.?)?`;
+const GALLONS_RANGE = new RegExp(String.raw`^(\d+)\s*[-–—]\s*(\d+)\s*\+?${GAL_SUFFIX}$`, "i");
+const GALLONS_OPEN = new RegExp(String.raw`^(\d+)\s*\+${GAL_SUFFIX}$`, "i");
+const PRICE_CELL = /^\$?\s*(\d[\d,]*\.\d{2,3})\s*(?:\/\s*gal(?:lon)?\.?)?$/i;
 const MONEY = /^\$\s*([\d,]+(?:\.\d{1,2})?)$/;
 
 /** "Sep 5th 2026" -> "2026-09-05"; returns null when unparseable. */
@@ -157,6 +161,76 @@ function captionKey(raw: string): string {
   return norm(raw).replace(/:$/, "").trim().toLowerCase();
 }
 
+/**
+ * Records a piece of the page that was ignored rather than parsed. Skips are
+ * deliberately NOT errors: one unreadable listing must not cost the day's data
+ * for every other dealer on the page. They stay visible in Workers Logs.
+ */
+function skip(message: string): void {
+  console.warn(`PARSE_SKIP ${message}`);
+}
+
+/** A real listing is ~6 KB; the cap only guards the log line against a runaway slice. */
+const MAX_LOGGED_LISTING_CHARS = 16 * 1024;
+
+/**
+ * Logs a listing that could not be parsed, with enough of it to reproduce the
+ * failure offline: the listing's raw HTML plus what the parser extracted from
+ * it. Grep Workers Logs for PARSE_SKIP_LISTING, save `html` as a fixture, and
+ * tune the parser against it. One JSON line so the logs viewer indexes fields.
+ */
+function logSkippedListing(
+  html: string,
+  draft: ListingDraft,
+  err: ParseError,
+  zip: string | undefined,
+): void {
+  console.warn(
+    `PARSE_SKIP_LISTING ${JSON.stringify({
+      zip: zip ?? null,
+      listing_index: draft.index,
+      reason: err.message,
+      detail: err.detail ?? null,
+      forms: draft.forms.map((f) => ({
+        dealerids: f.dealerIds,
+        enumtypes: f.enumTypes,
+        table_class: f.tableClass,
+        cells: f.cells,
+      })),
+      meta: Object.fromEntries(draft.meta),
+      html: listingHtml(html, draft.index),
+    })}`,
+  );
+}
+
+/**
+ * Raw HTML of the index-th `div.boxlisting`, for diagnostics only: from its
+ * opening tag to the next listing's (or the cap). Positions are found on the
+ * comment-masked copy, which HTMLRewriter's numbering agrees with, and sliced
+ * from the original so the log shows the page exactly as served.
+ */
+function listingHtml(html: string, index: number): string | null {
+  const masked = maskNonMarkup(html);
+  const lower = masked.toLowerCase();
+  const starts: number[] = [];
+  let i = 0;
+  while (starts.length <= index + 1) {
+    const at = lower.indexOf("<div", i);
+    if (at === -1) break;
+    const end = masked.indexOf(">", at);
+    if (end === -1) break;
+    const classes = attrValue(masked.slice(at, end + 1), "class") ?? "";
+    if (` ${classes.toLowerCase().replace(/\s+/g, " ")} `.includes(" boxlisting ")) {
+      starts.push(at);
+    }
+    i = end + 1;
+  }
+  const start = starts[index];
+  if (start === undefined) return null;
+  const stop = Math.min(starts[index + 1] ?? html.length, start + MAX_LOGGED_LISTING_CHARS);
+  return html.slice(start, stop);
+}
+
 function parseMoney(raw: string): number | null {
   const m = MONEY.exec(norm(raw));
   if (!m) return null;
@@ -199,22 +273,24 @@ function tiersFromForm(
       continue;
     }
 
+    // Best effort: a tier whose price cannot be read is dropped and logged, and
+    // the listing keeps whatever tiers it does have. A tier we cannot read is
+    // never guessed at, so nothing wrong is published — only something missing.
     const price = PRICE_CELL.exec(priceCell);
-    if (!price) {
-      throw new ParseError(
+    const pricePerGallon = price ? Number(price[1]!.replace(/,/g, "")) : NaN;
+    if (!Number.isFinite(pricePerGallon) || pricePerGallon <= 0) {
+      skip(
         `listing index ${draft.index}: ${paymentType} tier "${gallonsCell}" has ` +
-          `no valid price cell beside it (got "${priceCell}") — refusing to ` +
-          `silently drop a tier that could be the cheapest price`,
-        { listingIndex: draft.index, paymentType, gallonsCell, priceCell },
+          `no readable price beside it (got "${priceCell}"); tier dropped`,
       );
+      continue;
     }
-    const pricePerGallon = Number(price[1]!.replace(/,/g, ""));
-    if (!Number.isFinite(pricePerGallon)) {
-      throw new ParseError(
-        `listing index ${draft.index}: ${paymentType} tier "${gallonsCell}" has ` +
-          `an unreadable price "${priceCell}"`,
-        { listingIndex: draft.index, paymentType, priceCell },
+    if (gallonMax !== null && gallonMax < gallonMin) {
+      skip(
+        `listing index ${draft.index}: ${paymentType} tier "${gallonsCell}" is an ` +
+          `inverted range; tier dropped`,
       );
+      continue;
     }
 
     tiers.push({
@@ -369,10 +445,6 @@ function finaliseListing(draft: ListingDraft): ParsedListing {
 // ---------------------------------------------------------------------------
 
 /**
- * Throws ParseError on a structurally broken page.
- * Returns [] for a valid page with no listings.
- */
-/**
  * Price-tier extraction by string scanning, deliberately NOT via HTMLRewriter.
  *
  * Profiling (see docs/cpu-measurement.md) showed the native tokenizer costs
@@ -389,9 +461,9 @@ function finaliseListing(draft: ListingDraft): ParsedListing {
  *
  * The markup this relies on is narrow and asserted by the fixture tests: a
  * `table` carrying class `paywithcash` or `paybycredit`, containing no nested
- * table, whose cells are plain `<td>`s. Drift is caught by the tier-count and
- * pairing rules in finaliseListing(), which raise ParseError rather than
- * silently returning fewer prices.
+ * table, whose cells are plain `<td>`s. A listing that drifts from it is
+ * skipped and logged as PARSE_SKIP; only a page where no listing parses at all
+ * raises ParseError.
  */
 interface RawPriceTable {
   payment: PaymentType;
@@ -508,9 +580,10 @@ function attrValue(tag: string, name: string): string | null {
  *      never associated by ordinal position across two independent parses.
  *   3. Tag matching is case-insensitive; every scan is a linear `indexOf` walk
  *      with no backtracking regex on the hot path.
- *   4. It fails closed: an unterminated tag, a nested table, or an odd cell
- *      count raises ParseError rather than returning a short table that
- *      `finaliseListing` would happily accept.
+ *   4. It fails closed per table: an unterminated tag, a nested table, or an
+ *      odd cell count yields NO cells for that table rather than a short one
+ *      that `finaliseListing` would happily accept. The rest of the page is
+ *      unaffected.
  */
 export function extractPriceTables(html: string): RawPriceTable[] {
   const masked = maskNonMarkup(html);
@@ -549,7 +622,8 @@ function readPriceTable(region: string, index: number): RawPriceTable | null {
   if (tableAt === -1) return null;
   const tableTagEnd = region.indexOf(">", tableAt);
   if (tableTagEnd === -1) {
-    throw new ParseError(`price table ${index}: unterminated <table> tag`, { index });
+    skip(`price table ${index}: unterminated <table> tag; table ignored`);
+    return null;
   }
   const classes = attrValue(region.slice(tableAt, tableTagEnd + 1), "class") ?? "";
   const padded = ` ${classes.toLowerCase().replace(/\s+/g, " ")} `;
@@ -560,6 +634,32 @@ function readPriceTable(region: string, index: number): RawPriceTable | null {
       : null;
   if (payment === null) return null;
 
+  // A table whose cells cannot be read safely contributes no tiers at all —
+  // never a truncated set — but it is still returned, so its form keeps its
+  // place and the rest of the page parses normally.
+  let cells: string[] = [];
+  try {
+    cells = readCells(region, lower, tableTagEnd, index, payment);
+  } catch (err) {
+    if (!(err instanceof ParseError)) throw err;
+    skip(`${err.message}; table ignored`);
+  }
+
+  return {
+    payment,
+    dealerId: hiddenInputValue(region, "dealerid"),
+    enumType: hiddenInputValue(region, "enumtype"),
+    cells,
+  };
+}
+
+function readCells(
+  region: string,
+  lower: string,
+  tableTagEnd: number,
+  index: number,
+  payment: PaymentType,
+): string[] {
   const tableEnd = lower.indexOf("</table", tableTagEnd);
   if (tableEnd === -1) {
     throw new ParseError(
@@ -574,13 +674,7 @@ function readPriceTable(region: string, index: number): RawPriceTable | null {
       { index },
     );
   }
-
-  return {
-    payment,
-    dealerId: hiddenInputValue(region, "dealerid"),
-    enumType: hiddenInputValue(region, "enumtype"),
-    cells: extractCells(body, index, payment),
-  };
+  return extractCells(body, index, payment);
 }
 
 /** Value of `<input name="NAME" value="...">` within one form region. */
@@ -646,8 +740,17 @@ function extractCells(
   return cells;
 }
 
+/**
+ * Best effort: listings (and individual tiers) that cannot be read are skipped
+ * and logged — PARSE_SKIP_LISTING with the listing's raw HTML, PARSE_SKIP for a
+ * dropped tier or table. `options.zip` only labels those log lines. Throws
+ * ParseError only when the page as a whole is unusable — oversized input, or
+ * listings present but none of them readable. Returns [] for a valid page with
+ * no listings.
+ */
 export async function parseListingsPage(
   html: string,
+  options: { zip?: string } = {},
 ): Promise<ParsedListing[]> {
   // Guard runs before any parsing work is done.
   if (typeof html !== "string") {
@@ -801,85 +904,68 @@ export async function parseListingsPage(
   // Attach the string-scanned price cells.
   //
   // The scan reads each price table from inside its own `tranction.php` form and
-  // carries that form's OWN dealerid and enumtype alongside the cells, so prices
-  // and dealer identity already travel together. What follows is therefore a
-  // cross-check between two independent parses, not the thing that establishes
-  // ownership: position must agree, and so must dealerid and payment type.
+  // carries that form's OWN dealerid and enumtype alongside the cells, so a
+  // table is joined to the parsed form with the SAME (dealerid, payment type) —
+  // never by bare page position. A positional join lets one listing with a
+  // missing or extra table shift every later dealer's prices onto its
+  // neighbour, and forced the whole page to be rejected to prevent that. Keyed,
+  // a broken listing only ever costs itself.
   //
-  // An earlier version joined purely on ordinal position and asserted only the
-  // counts and the table class. That is not sufficient — markup that shifts the
-  // sequence by one can satisfy both and file every dealer's prices under the
-  // preceding dealer.
-  const tables = extractPriceTables(html);
-  // Each form remembers which listing it belongs to, so an error can name the
-  // listing a human would look for, not just a table ordinal.
-  const formsInOrder: Array<{ form: FormDraft; listingIndex: number }> = [];
-  for (const draft of drafts) {
-    for (const form of draft.forms) {
-      formsInOrder.push({ form, listingIndex: draft.index });
-    }
-  }
-
-  if (tables.length !== formsInOrder.length) {
-    throw new ParseError(
-      `found ${tables.length} price table(s) but ${formsInOrder.length} order ` +
-        `form(s); the two must correspond one to one`,
-      { tables: tables.length, forms: formsInOrder.length },
-    );
-  }
-
-  for (let i = 0; i < tables.length; i++) {
-    const table = tables[i] as RawPriceTable;
-    const owner = formsInOrder[i] as { form: FormDraft; listingIndex: number };
-    const target = owner.form;
-    const where = `listing index ${owner.listingIndex} / price table ${i}`;
-
-    if (target.tableClass !== null && target.tableClass !== table.payment) {
-      throw new ParseError(
-        `${where} is "${table.payment}" but the form's table element was ` +
-          `"${target.tableClass}"; the scan and the parse disagree on order`,
-        { tableIndex: i, listingIndex: owner.listingIndex },
-      );
-    }
-
-    // The decisive check: the dealerid the SCAN read from this form region must
-    // be the dealerid HTMLRewriter read from the same form. If the two parses
-    // have drifted out of step, these differ and we refuse rather than publish
-    // one dealer's prices under another's identity.
-    const scannedDealer = table.dealerId;
-    const parsedDealer = target.dealerIds[0] ?? null;
-    if (scannedDealer !== null && parsedDealer !== null && scannedDealer !== parsedDealer) {
-      throw new ParseError(
-        `${where} carries dealerid "${scannedDealer}" but the parsed form carries ` +
-          `"${parsedDealer}"; the scan and the parse disagree on which dealer ` +
-          `these prices belong to`,
-        { tableIndex: i, listingIndex: owner.listingIndex, scannedDealer, parsedDealer },
-      );
-    }
-    if (scannedDealer === null || parsedDealer === null) {
-      throw new ParseError(
-        `${where} could not be tied to a dealerid by both passes ` +
-          `(scan=${String(scannedDealer)}, parse=${String(parsedDealer)})`,
-        { tableIndex: i, listingIndex: owner.listingIndex },
-      );
-    }
-
-    // Same for payment type, read independently from the form's enumtype input.
+  // Should a dealer appear more than once, tables and forms sharing a key are
+  // paired in document order, which both passes see identically.
+  const byKey = new Map<string, RawPriceTable[]>();
+  for (const table of extractPriceTables(html)) {
+    if (table.dealerId === null) continue;
     const scannedType =
       table.enumType === null ? null : normaliseEnumType(table.enumType);
     if (scannedType !== null && scannedType !== table.payment) {
-      throw new ParseError(
-        `${where} has enumtype "${scannedType}" but table class ` +
-          `"${table.payment}"`,
-        { tableIndex: i, listingIndex: owner.listingIndex },
+      skip(
+        `price table for dealerid "${table.dealerId}" has enumtype ` +
+          `"${scannedType}" but table class "${table.payment}"; table ignored`,
       );
+      continue;
     }
-
-    target.cells = table.cells;
+    const key = `${norm(table.dealerId)}:${table.payment}`;
+    const queue = byKey.get(key);
+    if (queue) queue.push(table);
+    else byKey.set(key, [table]);
   }
 
   for (const draft of drafts) {
-    listings.push(finaliseListing(draft));
+    for (const form of draft.forms) {
+      // Forms with a missing or unrecognised dealerid/enumtype get no cells;
+      // finaliseListing reports exactly what is wrong and skips the listing.
+      if (form.dealerIds.length !== 1 || form.enumTypes.length !== 1) continue;
+      const payment = normaliseEnumType(form.enumTypes[0]!);
+      if (payment === null) continue;
+      const table = byKey.get(`${norm(form.dealerIds[0]!)}:${payment}`)?.shift();
+      if (table !== undefined) form.cells = table.cells;
+    }
+  }
+
+  // Best effort, listing by listing: an unreadable listing is skipped and
+  // logged, and every other dealer on the page is still recorded.
+  const skipped: ParseError[] = [];
+  for (const draft of drafts) {
+    try {
+      listings.push(finaliseListing(draft));
+    } catch (err) {
+      if (!(err instanceof ParseError)) throw err;
+      skipped.push(err);
+      logSkippedListing(html, draft, err, options.zip);
+    }
+  }
+
+  // ...but when NOTHING on a page with listings could be read, that is markup
+  // drift across the whole site, not one odd dealer, and it must still reach
+  // the operator as a ParseError.
+  if (listings.length === 0) {
+    const first = skipped[0]!;
+    throw new ParseError(
+      `none of the ${drafts.length} listing(s) could be parsed; first failure: ` +
+        first.message,
+      { listings: drafts.length, first: first.detail },
+    );
   }
 
   return listings;
