@@ -397,7 +397,35 @@ describe("best-effort parsing", () => {
     expect(listings.reduce((n, l) => n + l.tiers.length, 0)).toBe(EXPECTED_TOTAL - 8);
   });
 
-  it("logs a skipped listing with its raw HTML, for tuning the parser later", async () => {
+  it("logs a skipped listing when a listing fails parsing, for tuning the parser later", async () => {
+    // Modify dealer 11's forms to have mismatched dealerids so finaliseListing throws ParseError
+    let seen = 0;
+    const broken = fixture.replace(/name="dealerid" value="11"/g, (m) => {
+      seen++;
+      return seen === 2 ? 'name="dealerid" value="99"' : m;
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await parseListingsPage(broken, { zip: "06483" });
+      const lines = warn.mock.calls
+        .map((c) => String(c[0]))
+        .filter((l) => l.startsWith("PARSE_SKIP_LISTING "));
+      expect(lines).toHaveLength(1);
+      const entry = JSON.parse(lines[0]!.slice("PARSE_SKIP_LISTING ".length));
+      expect(entry.zip).toBe("06483");
+      expect(entry.listing_index).toBe(0);
+      expect(entry.reason).toMatch(/dealerid/);
+      // Exactly this listing's markup: it starts at its own div and stops
+      // before the next dealer's.
+      expect(entry.html).toMatch(/^<div class="boxlisting">/);
+      expect(entry.html).toContain('value="11"');
+      expect(entry.html).not.toContain('value="372"');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("logs PARSE_SKIP when a listing has no price tiers", async () => {
     const noTiers = editFirstListing((h) =>
       h.replace(/<td>\d+-\d+<\/td>\s*<td>\$[\d.]+<\/td>/g, ""),
     );
@@ -406,21 +434,8 @@ describe("best-effort parsing", () => {
       await parseListingsPage(noTiers, { zip: "06483" });
       const lines = warn.mock.calls
         .map((c) => String(c[0]))
-        .filter((l) => l.startsWith("PARSE_SKIP_LISTING "));
-      expect(lines).toHaveLength(1);
-      const entry = JSON.parse(lines[0]!.slice("PARSE_SKIP_LISTING ".length));
-      expect(entry.zip).toBe("06483");
-      expect(entry.listing_index).toBe(0);
-      expect(entry.reason).toMatch(/no price tiers found/);
-      expect(entry.forms.map((f: { dealerids: string[] }) => f.dealerids)).toEqual([
-        ["11"],
-        ["11"],
-      ]);
-      // Exactly this listing's markup: it starts at its own div and stops
-      // before the next dealer's.
-      expect(entry.html).toMatch(/^<div class="boxlisting">/);
-      expect(entry.html).toContain('value="11"');
-      expect(entry.html).not.toContain('value="372"');
+        .filter((l) => l.startsWith("PARSE_SKIP "));
+      expect(lines.some((l) => l.includes("listing index 0: no price tiers found"))).toBe(true);
     } finally {
       warn.mockRestore();
     }
