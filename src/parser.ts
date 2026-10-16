@@ -303,7 +303,7 @@ function tiersFromForm(
   return tiers;
 }
 
-function finaliseListing(draft: ListingDraft): ParsedListing {
+function finaliseListing(draft: ListingDraft): ParsedListing | null {
   const idx = draft.index;
 
   if (draft.forms.length !== 2) {
@@ -401,10 +401,8 @@ function finaliseListing(draft: ListingDraft): ParsedListing {
   }
 
   if (tiers.length === 0) {
-    throw new ParseError(`listing index ${idx}: no price tiers found`, {
-      listingIndex: idx,
-      dealerId,
-    });
+    skip(`listing index ${idx}: no price tiers found`);
+    return null;
   }
 
   // ---- listing-level metadata -------------------------------------------
@@ -948,7 +946,10 @@ export async function parseListingsPage(
   const skipped: ParseError[] = [];
   for (const draft of drafts) {
     try {
-      listings.push(finaliseListing(draft));
+      const listing = finaliseListing(draft);
+      if (listing !== null) {
+        listings.push(listing);
+      }
     } catch (err) {
       if (!(err instanceof ParseError)) throw err;
       skipped.push(err);
@@ -960,11 +961,12 @@ export async function parseListingsPage(
   // drift across the whole site, not one odd dealer, and it must still reach
   // the operator as a ParseError.
   if (listings.length === 0) {
-    const first = skipped[0]!;
+    const firstMsg = skipped[0]?.message ?? "no price tiers found";
+    const firstDetail = skipped[0]?.detail;
     throw new ParseError(
       `none of the ${drafts.length} listing(s) could be parsed; first failure: ` +
-        first.message,
-      { listings: drafts.length, first: first.detail },
+        firstMsg,
+      { listings: drafts.length, first: firstDetail },
     );
   }
 
